@@ -1,0 +1,56 @@
+{
+  "manifest_version": 3,
+  "name": "Reddit Image Grab",
+  "version": "1.0.1",
+  "description": "One click downloads every image in a Reddit gallery post to a folder you choose.",
+  "permissions": [
+    "downloads",
+    "storage",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "*://v.redd.it/*"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "reddit-grab@talix.dev",
+      "strict_min_version": "115.0"
+    }
+  },
+  "background": {
+    "service_worker": "background.js",
+    "scripts": [
+      "background.js"
+    ]
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://www.reddit.com/*",
+        "*://old.reddit.com/*",
+        "*://new.reddit.com/*",
+        "*://sh.reddit.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Download images from this Reddit post"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": false
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

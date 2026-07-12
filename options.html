@@ -1,0 +1,61 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        min-width: 340px;
+        margin: 0;
+        padding: 16px;
+        color: #1a1a1b;
+      }
+      h1 { font-size: 15px; margin: 0 0 12px; }
+      label { display: block; font-weight: 600; margin-bottom: 4px; }
+      input[type="text"] {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 7px 10px;
+        border: 1px solid #ccc;
+        border-radius: 6px;
+        font: inherit;
+      }
+      .row { margin-bottom: 14px; }
+      .check { display: flex; align-items: center; gap: 8px; font-weight: 400; }
+      .hint { color: #666; font-size: 12px; margin-top: 4px; }
+      button {
+        padding: 7px 16px;
+        border: none;
+        border-radius: 6px;
+        background: #d93a00;
+        color: #fff;
+        font: 600 13px/1 inherit;
+        cursor: pointer;
+      }
+      #status { color: #0e8a16; font-size: 12px; margin-left: 8px; }
+    </style>
+  </head>
+  <body>
+    <h1>Reddit Image Grab</h1>
+
+    <div class="row">
+      <label for="folder">Save into folder</label>
+      <input type="text" id="folder" placeholder="PhotoVault Inbox" />
+      <div class="hint">
+        Relative to your Downloads folder — Chrome doesn't let extensions save
+        anywhere else. Use "/" to nest, e.g. <code>Reddit/wallpapers</code>.
+      </div>
+    </div>
+
+    <div class="row">
+      <label class="check">
+        <input type="checkbox" id="bySubreddit" />
+        Add a subfolder per subreddit
+      </label>
+    </div>
+
+    <button id="save">Save</button><span id="status"></span>
+
+    <script src="options.js"></script>
+  </body>
+</html>
