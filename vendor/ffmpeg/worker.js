@@ -1,27 +1,15 @@
 /// <reference no-default-lib="true" />
 /// <reference lib="esnext" />
 /// <reference lib="webworker" />
-import { CORE_URL, FFMessageType } from "./const.js";
-import { ERROR_UNKNOWN_MESSAGE_TYPE, ERROR_NOT_LOADED, ERROR_IMPORT_FAILURE, } from "./errors.js";
+import { FFMessageType } from "./const.js";
+import createFFmpegCore from "../core/ffmpeg-core.js";
+import { ERROR_UNKNOWN_MESSAGE_TYPE, ERROR_NOT_LOADED, } from "./errors.js";
 let ffmpeg;
 const load = async ({ coreURL: _coreURL, wasmURL: _wasmURL, workerURL: _workerURL, }) => {
     const first = !ffmpeg;
-    try {
-        if (!_coreURL)
-            _coreURL = CORE_URL;
-        // when web worker type is `classic`.
-        importScripts(_coreURL);
-    }
-    catch {
-        if (!_coreURL || _coreURL === CORE_URL)
-            _coreURL = CORE_URL.replace('/umd/', '/esm/');
-        // when web worker type is `module`.
-        self.createFFmpegCore = (await import(
-        /* @vite-ignore */ _coreURL)).default;
-        if (!self.createFFmpegCore) {
-            throw ERROR_IMPORT_FAILURE;
-        }
-    }
+    if (!_coreURL)
+        _coreURL = new URL("../core/ffmpeg-core.js", import.meta.url).href;
+    self.createFFmpegCore = createFFmpegCore;
     const coreURL = _coreURL;
     const wasmURL = _wasmURL ? _wasmURL : _coreURL.replace(/.js$/g, ".wasm");
     const workerURL = _workerURL

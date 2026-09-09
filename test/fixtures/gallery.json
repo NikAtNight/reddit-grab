@@ -1,0 +1,30 @@
+{
+  "id": "gallery-clicked",
+  "subreddit": "pics",
+  "is_gallery": true,
+  "gallery_data": {
+    "items": [
+      { "media_id": "second" },
+      { "media_id": "broken" },
+      { "media_id": "first" }
+    ]
+  },
+  "media_metadata": {
+    "first": {
+      "status": "valid",
+      "m": "image/jpeg",
+      "e": "Image"
+    },
+    "second": {
+      "status": "valid",
+      "m": "image/png",
+      "e": "Image",
+      "s": { "u": "https://preview.redd.it/second.png?width=4096&amp;format=png" }
+    },
+    "broken": {
+      "status": "failed",
+      "m": "image/webp",
+      "e": "Image"
+    }
+  }
+}

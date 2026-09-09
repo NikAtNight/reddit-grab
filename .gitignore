@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.DS_Store
+web-ext-artifacts/
+
+# Local Reddit account inventories and migration checkpoints.
+reddit-joined-inventory.*
+reddit-joined-checkpoint.json
+reddit-profiles-inventory.*
+reddit-profiles-checkpoint.json

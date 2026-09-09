@@ -1,20 +1,23 @@
-// Offscreen-document entry point (Chrome). Receives mux jobs from the
-// background service worker, returns a blob: URL, and revokes it when told
-// the download has finished. Firefox skips this file entirely — its
-// background page imports mux-lib.js directly.
+// Chrome offscreen document entry point. Firefox performs the same operation
+// directly from its background document.
 
 import { muxToBlobUrl } from "./mux-lib.js";
 
 const api = typeof browser !== "undefined" ? browser : chrome;
 
-api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg?.type === "mux") {
-    muxToBlobUrl(msg.videoUrl, msg.audioUrl)
+api.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.target !== "mux") return undefined;
+
+  if (message.type === "merge-streams") {
+    muxToBlobUrl(message.videoUrl, message.audioUrl)
       .then((blobUrl) => sendResponse({ ok: true, blobUrl }))
-      .catch((err) => sendResponse({ ok: false, error: err.message }));
-    return true; // async response
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
   }
-  if (msg?.type === "mux-release") {
-    URL.revokeObjectURL(msg.blobUrl);
+
+  if (message.type === "release-blob") {
+    URL.revokeObjectURL(message.blobUrl);
+    sendResponse({ ok: true });
   }
+  return undefined;
 });

@@ -1,0 +1,12 @@
+{
+  "id": "clicked-post",
+  "subreddit": "reposts",
+  "url": "https://example.com/no-media",
+  "crosspost_parent_list": [
+    {
+      "id": "original-post",
+      "subreddit": "wallpapers",
+      "url": "https://i.redd.it/original.webp?token=signed"
+    }
+  ]
+}

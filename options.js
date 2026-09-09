@@ -1,21 +1,24 @@
 const api = typeof browser !== "undefined" ? browser : chrome;
+const DEFAULTS = { folder: "Reddit Media", bySubreddit: false };
 
-const DEFAULTS = { folder: "PhotoVault Inbox", bySubreddit: false };
-
-const folderInput = document.getElementById("folder");
-const bySubredditInput = document.getElementById("bySubreddit");
+const form = document.querySelector("form");
+const folder = document.getElementById("folder");
+const bySubreddit = document.getElementById("by-subreddit");
 const status = document.getElementById("status");
 
-api.storage.sync.get(DEFAULTS).then(({ folder, bySubreddit }) => {
-  folderInput.value = folder;
-  bySubredditInput.checked = bySubreddit;
+api.storage.sync.get(DEFAULTS).then((settings) => {
+  folder.value = settings.folder;
+  bySubreddit.checked = settings.bySubreddit;
 });
 
-document.getElementById("save").addEventListener("click", async () => {
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
   await api.storage.sync.set({
-    folder: folderInput.value.trim(),
-    bySubreddit: bySubredditInput.checked,
+    folder: folder.value.trim(),
+    bySubreddit: bySubreddit.checked,
   });
   status.textContent = "Saved";
-  setTimeout(() => (status.textContent = ""), 1500);
+  setTimeout(() => {
+    status.textContent = "";
+  }, 1500);
 });

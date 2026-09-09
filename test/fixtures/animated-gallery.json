@@ -1,0 +1,28 @@
+{
+  "id": "animated",
+  "subreddit": "gifs",
+  "is_gallery": true,
+  "gallery_data": {
+    "items": [
+      { "media_id": "both" },
+      { "media_id": "gif-only" }
+    ]
+  },
+  "media_metadata": {
+    "both": {
+      "status": "valid",
+      "m": "image/gif",
+      "e": "AnimatedImage",
+      "s": {
+        "gif": "https://preview.redd.it/both.gif",
+        "mp4": "https://preview.redd.it/both.mp4"
+      }
+    },
+    "gif-only": {
+      "status": "valid",
+      "m": "image/gif",
+      "e": "AnimatedImage",
+      "s": { "gif": "https://preview.redd.it/only.gif" }
+    }
+  }
+}

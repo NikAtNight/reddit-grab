@@ -1,0 +1,345 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Custom feed picker browser checks</title>
+<h1>Custom feed picker browser checks</h1>
+<pre id="results">Running…</pre>
+<script src="../../reddit-feeds.js"></script>
+<script>
+  // Reddit's author CSS overrides the browser's default [hidden] display rule.
+  const redditButtonStyle = document.createElement("style");
+  redditButtonStyle.textContent = "button { display: inline-block; }";
+  document.head.append(redditButtonStyle);
+  // All API responses are fixtures. No request is sent to Reddit.
+  const originalTarget = RedditGrabFeeds.targetFromUrl;
+  RedditGrabFeeds.targetFromUrl = (value) => originalTarget(
+    "https://www.reddit.com" + (new URL(value).searchParams.get("route") || "/user/example-user/")
+  );
+  const feeds = [
+    { path: "/user/tester/m/profiles", display_name: "Profiles", visibility: "private", can_edit: true,
+      subreddits: [{ name: "u_preexisting" }, { name: "already" }] },
+    { path: "/user/tester/m/other", display_name: "Other", visibility: "private", can_edit: true,
+      subreddits: [{ name: "U_PREEXISTING" }, { name: "already" }] },
+    { path: "/user/tester/m/full", display_name: "Full feed", visibility: "private", can_edit: true,
+      subreddits: Array.from({ length: 100 }, (_, i) => ({ name: `member${i}` })) },
+  ];
+  let writes = 0;
+  let listingReads = 0;
+  let holdRead = false;
+  let releaseRead;
+  let holdWrite = false;
+  let releaseWrite;
+  let failLookup = false;
+  let holdListing = false;
+  let releaseListing;
+  let staleListing = null;
+  window.fetch = async (path, options) => {
+    if (failLookup) { failLookup = false; return new Response("Unavailable", { status: 500 }); }
+    if (path === "/api/me.json") return Response.json({ data: { name: "tester", modhash: "fixture-only" } });
+    if (path.startsWith("/api/info.json")) {
+      const name = new URL(path, location.origin).searchParams.get("sr_name");
+      return Response.json({ data: { children: [{ data: { name: "t5_fixture", display_name: name } }] } });
+    }
+    if (path.startsWith("/api/multi/mine")) {
+      listingReads++;
+      const response = Response.json(staleListing || feeds.map(data => ({ data })));
+      if (holdListing) { holdListing = false; await new Promise(resolve => { releaseListing = resolve; }); }
+      return response;
+    }
+    const feed = feeds.find(f => path.startsWith("/api/multi" + f.path));
+    if (!feed) throw new Error("Unexpected fixture request: " + path);
+    if (options.method === "PUT") {
+      if (holdWrite) { holdWrite = false; await new Promise(resolve => { releaseWrite = resolve; }); }
+      writes++;
+      feed.subreddits.push(JSON.parse(options.body.get("model")));
+      return Response.json({});
+    }
+    if (holdRead) { holdRead = false; await new Promise(resolve => { releaseRead = resolve; }); }
+    return Response.json({ data: feed });
+  };
+</script>
+<script src="../../custom-feeds.js"></script>
+<script>
+  (async () => {
+    const results = [];
+    const host = document.getElementById("reddit-grab-custom-feeds");
+    const root = host.shadowRoot;
+    const get = id => root.getElementById(id);
+    const row = () => [...root.querySelectorAll(".feed")].find(b => b.textContent.includes("Profiles"));
+    const wait = async predicate => {
+      for (let i = 0; i < 300; i++) {
+        if (predicate()) return;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      throw new Error("Timed out waiting for UI");
+    };
+    const check = (condition, message) => {
+      if (!condition) throw new Error(message);
+      results.push("PASS: " + message);
+    };
+    const navigate = route => {
+      history.replaceState(null, "", "?route=" + encodeURIComponent(route));
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    };
+    const open = async () => { get("launcher").click(); await wait(() => row() && !get("search").disabled); };
+    try {
+      check(!host.hidden && get("launcher").getAttribute("aria-label").includes("u/example-user"), "profile launcher visible and correctly labeled");
+      const rect = get("launcher").getBoundingClientRect();
+      check(rect.right <= innerWidth && rect.bottom <= innerHeight && rect.right >= innerWidth - 30 && rect.bottom >= innerHeight - 30, "launcher positioned inside bottom-right viewport");
+      await wait(() => get("launcher").textContent.includes("Add to feed"));
+      check(get("panel").hidden, "membership checks run without opening the picker");
+      const post = document.createElement("shreddit-post");
+      post.setAttribute("subreddit-name", "ALREADY");
+      const join = document.createElement("shreddit-join-button");
+      join.style.display = "inline-flex";
+      post.append(join);
+      const unknown = document.createElement("shreddit-post");
+      unknown.setAttribute("subreddit-name", "not_in_feeds");
+      const unknownJoin = document.createElement("shreddit-join-button");
+      unknown.append(unknownJoin);
+      const outsideJoin = document.createElement("shreddit-join-button");
+      document.body.append(post, unknown, outsideJoin);
+      await wait(() => join.style.display === "none");
+      check(!unknownJoin.nextElementSibling.hidden && !outsideJoin.style.display && join.nextElementSibling.hidden, "replace unknown post Join and hide existing feed members, leaving outside controls alone");
+      check(getComputedStyle(join.nextElementSibling).display === "none" && join.nextElementSibling.getBoundingClientRect().width === 0,
+        "existing-member button is actually invisible under Reddit button CSS");
+      check(getComputedStyle(unknownJoin.nextElementSibling).display !== "none",
+        "non-member button remains rendered under Reddit button CSS");
+      post.append(unknown);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      check(!unknownJoin.nextElementSibling.hidden, "nested posts use their own community membership");
+      const shadowPost = document.createElement("shreddit-post");
+      shadowPost.setAttribute("subreddit-prefixed-name", "r/already");
+      const shadow = shadowPost.attachShadow({ mode: "open" });
+      const shadowJoin = document.createElement("button");
+      shadowJoin.setAttribute("data-post-click-location", "join");
+      shadow.append(shadowJoin);
+      document.body.append(shadowPost);
+      await wait(() => shadowJoin.style.display === "none");
+      check(true, "newly scrolled posts and shadow-root Join controls are hidden");
+      post.setAttribute("subreddit-name", "not_in_feeds");
+      await wait(() => !join.nextElementSibling.hidden);
+      check(join.nextElementSibling.dataset.community === "not_in_feeds", "recycled post updates inline picker target");
+      post.setAttribute("subreddit-name", "already");
+      await wait(() => join.nextElementSibling.hidden && join.nextElementSibling.dataset.community === "already");
+      feeds.forEach(feed => { feed.subreddits = feed.subreddits.filter(member => member.name !== "already"); });
+      window.dispatchEvent(new Event("focus"));
+      await wait(() => !join.nextElementSibling.hidden);
+      check(!shadowJoin.nextElementSibling.hidden, "removal from all feeds restores Add to feed controls on refresh");
+      feeds[0].subreddits.push({ name: "already" });
+      feeds[1].subreddits.push({ name: "already" });
+      navigate("/user/preexisting/");
+      await wait(() => get("launcher").textContent.includes("In 2 feeds"));
+      check(get("launcher").title.includes("Profiles") && get("launcher").title.includes("Other"), "existing profile memberships show count and feed names");
+      navigate("/r/already/");
+      await wait(() => get("launcher").textContent.includes("In 2 feeds"));
+      check(get("panel").hidden, "community memberships appear without opening the picker");
+      navigate("/user/example-user/");
+      check(get("launcher").textContent.includes("Checking"), "navigation clears the previous membership indicator");
+      await open();
+      check(root.activeElement === get("search"), "search receives keyboard focus");
+      check([...root.querySelectorAll(".feed")].find(b => b.textContent.includes("Full feed")).disabled, "full feed disabled");
+      get("search").value = "nonexistent";
+      get("search").dispatchEvent(new Event("input"));
+      check(!root.querySelector(".feed"), "search filters feed list");
+      get("search").value = "";
+      get("search").dispatchEvent(new Event("input"));
+      const add = row(); add.click(); add.click();
+      await wait(() => get("status").textContent.includes("was added"));
+      check(writes === 1 && row().disabled, "repeated clicks produce one verified add");
+      check(get("launcher").textContent.includes("In 1 feed"), "verified add immediately updates the launcher");
+      get("search").dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      check(get("panel").hidden && root.activeElement === get("launcher"), "Escape dismisses picker and restores focus");
+      staleListing = feeds.map(data => ({ data: { ...data,
+        subreddits: data.subreddits.filter(member => member.name !== "u_example-user") } }));
+      await open();
+      check(row().disabled && row().textContent.includes("Added"), "reopen recognizes existing membership");
+      check(get("launcher").textContent.includes("In 1 feed"), "stale aggregate listing cannot erase verified picker addition");
+      staleListing = null;
+      navigate("/r/example/");
+      check(get("panel").hidden && get("launcher").getAttribute("aria-label").includes("r/example"), "SPA navigation resets target and closes picker");
+      await open();
+      holdRead = true;
+      row().click();
+      await wait(() => releaseRead);
+      navigate("/user/next-profile/");
+      releaseRead();
+      await open();
+      await wait(() => !row().disabled);
+      check(writes === 1, "navigation before write prevents adding a stale target");
+      holdWrite = true;
+      row().click();
+      await wait(() => releaseWrite);
+      get("close").click();
+      await open();
+      check(row().disabled, "reopened picker waits for pending mutation");
+      releaseWrite();
+      await wait(() => row()?.textContent.includes("Added") && !get("status").textContent.includes("Finishing"));
+      check(writes === 2, "reopened picker refreshes membership when pending add finishes");
+      navigate("/user/delayed-profile/");
+      await open();
+      holdWrite = true;
+      releaseWrite = null;
+      row().click();
+      await wait(() => releaseWrite);
+      get("close").click();
+      holdListing = true;
+      get("launcher").click();
+      await wait(() => releaseListing);
+      releaseWrite();
+      await wait(() => row()?.textContent.includes("Added"));
+      releaseListing();
+      await new Promise(resolve => setTimeout(resolve, 50));
+      check(writes === 3 && row().disabled && get("launcher").textContent.includes("In 1 feed"), "delayed pre-write lookup cannot overwrite verified membership");
+      document.body.append(Object.assign(document.createElement("script"), { src: "../../custom-feeds.js" }));
+      await new Promise(resolve => setTimeout(resolve, 100));
+      check(document.querySelectorAll("#reddit-grab-custom-feeds").length === 1, "reinjection keeps one widget");
+      navigate("/user/external-profile/");
+      await wait(() => get("launcher").textContent.includes("Add to feed"));
+      feeds[0].subreddits.push({ name: "u_external-profile" });
+      window.dispatchEvent(new Event("focus"));
+      await wait(() => get("launcher").textContent.includes("In 1 feed"));
+      check(get("panel").hidden, "returning to the tab refreshes an addition made elsewhere");
+      feeds[1].subreddits.push({ name: "u_external-profile" });
+      get("launcher").dispatchEvent(new Event("pointerenter"));
+      await wait(() => get("launcher").textContent.includes("In 2 feeds"));
+      check(get("panel").hidden, "hover refreshes membership without opening picker");
+      feeds[1].subreddits = feeds[1].subreddits.filter(member => member.name !== "u_external-profile");
+      navigate("/user/external-profile/submitted/");
+      await wait(() => get("launcher").textContent.includes("In 1 feed"));
+      check(get("panel").hidden, "switching tabs on the same profile refreshes membership");
+      navigate("/r/just_added/");
+      const addedPost = document.createElement("shreddit-post");
+      addedPost.setAttribute("subreddit-name", "just_added");
+      const addedJoin = document.createElement("shreddit-join-button");
+      addedPost.append(addedJoin);
+      document.body.append(addedPost);
+      await open();
+      check(!addedJoin.nextElementSibling.hidden, "Add to feed stays visible before community is added");
+      row().click();
+      await wait(() => get("status").textContent.includes("was added"));
+      check(addedJoin.nextElementSibling.hidden, "verified picker addition immediately hides matching post Add to feed");
+      get("close").click();
+      await wait(() => join.style.display === "none");
+      failLookup = true;
+      navigate("/r/unavailable/");
+      await wait(() => get("launcher").textContent.includes("Check feed status"));
+      check(get("launcher").title.includes("HTTP 500"), "failed lookup shows unknown status rather than claiming no membership");
+      check(!join.nextElementSibling.hidden, "failed lookup offers Add to feed instead of trusting old membership");
+      navigate("/r/example/comments/abc/post");
+      check(host.hidden, "post pages hide launcher");
+      navigate("/");
+      check(host.hidden, "home page hides launcher");
+      navigate("/user/example-user/");
+      await wait(() => get("launcher").textContent.includes("In 1 feed"));
+      const postButton = unknownJoin.nextElementSibling;
+      unknown.style.cssText = "position:fixed;top:20px;left:20px;width:240px;height:60px;display:block";
+      const overlay = document.createElement("a");
+      overlay.href = "#post-overlay";
+      overlay.setAttribute("slot", "full-post-link");
+      overlay.style.cssText = "position:absolute;inset:0";
+      unknown.append(overlay);
+      const inlineRect = postButton.getBoundingClientRect();
+      check(document.elementFromPoint(inlineRect.x + inlineRect.width / 2, inlineRect.y + inlineRect.height / 2) === postButton,
+        "inline control receives pointer hits above the full-post link overlay");
+      let bubbled = 0;
+      unknown.addEventListener("click", () => { bubbled++; });
+      unknownJoin.setAttribute("slot", "join-button");
+      postButton.click();
+      await wait(() => row() && !get("search").disabled);
+      check(get("target").textContent === "r/not_in_feeds" && bubbled === 0, "inline control opens picker for post community without activating post");
+      check(postButton.getAttribute("slot") === "join-button", "inline replacement preserves Reddit slot placement");
+      get("close").click();
+      check(document.activeElement === postButton, "closing inline picker restores focus to its opener");
+      postButton.click();
+      await wait(() => row() && !get("search").disabled);
+      const beforeInline = writes;
+      row().click(); row().click();
+      await wait(() => get("status").textContent.includes("was added"));
+      check(writes === beforeInline + 1 && feeds[0].subreddits.some(member => member.name === "not_in_feeds"), "inline picker adds the community once, not the viewed profile");
+      check(postButton.hidden && get("launcher").textContent.includes("In 1 feed"), "inline addition updates posts and preserves viewed profile badge");
+      check(getComputedStyle(postButton).display === "none" && postButton.getBoundingClientRect().width === 0,
+        "verified inline addition removes the rendered button despite Reddit CSS");
+      get("close").click();
+      unknown.setAttribute("subreddit-name", "second_inline");
+      await wait(() => !postButton.hidden);
+      postButton.click();
+      await wait(() => row() && !get("search").disabled);
+      holdRead = true; releaseRead = null;
+      row().click();
+      await wait(() => releaseRead);
+      unknown.setAttribute("subreddit-name", "third_inline");
+      postButton.click();
+      releaseRead();
+      await wait(() => get("target").textContent === "r/third_inline" && row() && !row().disabled);
+      check(writes === beforeInline + 1, "switching post targets cancels a pending pre-write add");
+      get("close").click();
+      unknownJoin.setAttribute("is-subscribed", "true");
+      await wait(() => !postButton.isConnected);
+      check(unknownJoin.style.display === "", "Joined controls stay native and regain original display");
+      unknownJoin.removeAttribute("is-subscribed");
+      await wait(() => unknownJoin.nextElementSibling?.matches("[data-reddit-grab-post-feed]"));
+      navigate("/");
+      unknownJoin.nextElementSibling.click();
+      await wait(() => row() && !get("search").disabled);
+      check(!host.hidden && get("target").textContent === "r/third_inline", "inline picker also works without a profile or community page launcher");
+      get("close").click();
+      check(host.hidden, "closing inline picker on home hides the floating widget");
+      navigate("/user/example-user/");
+      await wait(() => get("launcher").textContent.includes("In 1 feed"));
+      history.pushState(null, "", "?route=" + encodeURIComponent("/user/unpolled-profile/"));
+      get("launcher").click();
+      await wait(() => row() && !get("search").disabled);
+      check(get("target").textContent === "u/unpolled-profile", "launcher resolves navigation before the URL poll runs");
+      const beforeNavigation = writes;
+      history.pushState(null, "", "?route=" + encodeURIComponent("/user/another-profile/"));
+      row().click();
+      await new Promise(resolve => setTimeout(resolve, 100));
+      check(writes === beforeNavigation && get("panel").hidden, "navigation before feed selection prevents stale writes even before URL poll");
+      const beforeFeedReads = listingReads;
+      navigate("/user/tester/m/profiles/");
+      check(host.hidden, "custom-feed pages do not show a page-target launcher");
+      await wait(() => listingReads > beforeFeedReads && join.nextElementSibling.hidden);
+      check(join.nextElementSibling.hidden && get("panel").hidden, "custom-feed page loads membership without opening picker");
+      const scrollPost = document.createElement("shreddit-post");
+      scrollPost.setAttribute("subreddit-name", "ALREADY");
+      const scrollJoin = document.createElement("shreddit-join-button");
+      scrollPost.append(scrollJoin);
+      document.body.append(scrollPost);
+      await wait(() => scrollJoin.nextElementSibling?.hidden);
+      check(listingReads === beforeFeedReads + 1, "scrolling custom-feed posts reuses membership without extra requests");
+      feeds.forEach(feed => { feed.subreddits = feed.subreddits.filter(member => member.name.toLowerCase() !== "already"); });
+      window.dispatchEvent(new Event("focus"));
+      await wait(() => !scrollJoin.nextElementSibling.hidden);
+      check(!join.nextElementSibling.hidden, "custom-feed membership refreshes on focus without a page target");
+      feeds[0].subreddits.push({ name: "already" });
+      navigate("/user/tester/m/profiles/new/?t=all");
+      await wait(() => scrollJoin.nextElementSibling.hidden);
+      check(host.hidden, "custom-feed sort navigation refreshes membership without a launcher");
+      unknown.setAttribute("subreddit-name", "capture_test");
+      await wait(() => unknownJoin.nextElementSibling?.dataset.community === "capture_test");
+      let redditClicks = 0;
+      const intercept = event => { redditClicks++; event.stopImmediatePropagation(); };
+      unknown.addEventListener("click", intercept, true);
+      unknownJoin.nextElementSibling.click();
+      await wait(() => !get("panel").hidden && !get("search").disabled);
+      check(get("target").textContent === "r/capture_test" && redditClicks === 0,
+        "inline click opens picker before Reddit's capturing post handler");
+      get("close").click();
+      unknown.removeEventListener("click", intercept, true);
+      const replacement = unknownJoin.nextElementSibling;
+      const clone = replacement.cloneNode(true);
+      replacement.replaceWith(clone);
+      unknown.setAttribute("subreddit-name", "redrawn_post");
+      clone.click();
+      await wait(() => !get("panel").hidden && !get("search").disabled);
+      check(get("target").textContent === "r/redrawn_post" && unknown.querySelectorAll("[data-reddit-grab-post-feed]").length === 1, "redrawn button opens picker for live community without its original listener or duplicates");
+      get("close").click();
+      window.browserCheckResult = { passed: results.length, failed: 0, checks: results };
+    } catch (error) {
+      window.browserCheckResult = { passed: results.length, failed: 1, checks: results, error: error.message };
+    }
+    document.getElementById("results").textContent = JSON.stringify(window.browserCheckResult, null, 2);
+    document.title = window.browserCheckResult.failed ? "FAIL: custom feed picker" : "PASS: custom feed picker";
+  })();
+</script>

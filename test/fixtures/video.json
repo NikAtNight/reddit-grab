@@ -1,0 +1,12 @@
+{
+  "id": "video-post",
+  "subreddit": "videos",
+  "secure_media": {
+    "reddit_video": {
+      "fallback_url": "https://v.redd.it/link/post/asset/media/DASH_1080.mp4?source=fallback&amp;token=signed",
+      "dash_url": "https://v.redd.it/link/post/asset/media/DASHPlaylist.mpd?token=signed",
+      "has_audio": true,
+      "is_gif": false
+    }
+  }
+}

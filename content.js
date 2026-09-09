@@ -1,355 +1,596 @@
-// Reddit Image Grab — content script.
-// Shows a "Save images" button when hovering an image/gallery post.
-// Clicking it fetches the post's JSON (which lists every gallery image at
-// full resolution) and hands the URLs to the background worker to download.
+// Reddit Media Grab — page UI and post JSON loading.
+//
+// Reddit hides per-post actions (Follow post, Save, Hide, Report) behind the
+// header's "···" overflow dropdown, so each one costs two clicks. This script
+// moves those items out of the dropdown into the post header as icon-only
+// buttons, and adds its own "Save media" action alongside them.
+//
+// The items are relocated, not recreated. The real <li> nodes carry the
+// handlers Reddit bound to them, so clicking one in the header is genuinely
+// the same event as clicking it inside the menu — there is nothing to
+// simulate, and no dependency on how those handlers are wired.
+//
+// Media extraction is intentionally independent of Reddit's rendered markup;
+// the DOM is used only to locate a post permalink and an injection point.
 
 (() => {
   "use strict";
 
-  // Firefox: promise-based `browser` namespace; Chrome: MV3 `chrome` is
-  // promise-based too, so they are interchangeable here.
+  if (globalThis.__redditMediaGrabLoaded) return;
+  globalThis.__redditMediaGrabLoaded = true;
+
   const api = typeof browser !== "undefined" ? browser : chrome;
 
-  let button = null;
-  let currentPost = null; // { el, permalink }
-  let busy = false;
+  const POST_SELECTOR =
+    'shreddit-post, article, [data-testid="post-container"], .thing[data-permalink]';
+  const OVERFLOW_SELECTORS = [
+    "shreddit-post-overflow-menu",
+    "rpl-dropdown",
+    "faceplate-dropdown-menu",
+  ];
+  // The trigger carries aria-haspopup rather than a slot attribute.
+  const TRIGGER_SELECTORS = [
+    'button[aria-haspopup="menu"]',
+    'button[slot="trigger"]',
+    '[slot="trigger"] button',
+    "button",
+  ];
+  // The action bar is the row holding vote / comments / share. It is a plain
+  // flex line with free space to its right, which the credit bar is not.
+  const ACTION_BAR_SELECTORS = ["rpl-action-bar", '[slot="action-bar"]'];
+  const SHARE_SELECTORS = [
+    "shreddit-post-share-button",
+    '[data-post-click-location="share"]',
+    '[data-post-click-location="comments-button"]',
+  ];
+  const MENU_SELECTOR = 'faceplate-menu, [role="menu"]';
+  const ITEM_SELECTOR = "li[id]";
+  const POST_ITEM_SELECTOR = 'li[id^="post-overflow-"]';
+  const ADOPTED_ATTR = "data-reddit-media-grab-item";
+  const SAVE_MEDIA_LABEL = "Save media";
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const BUTTON_SIZE = "32px";
+  const ICON_SIZE = "20";
 
-  // ---------------------------------------------------------------- overlay
+  const tick = (ms = 40) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  function ensureButton() {
-    if (button) return button;
-    button = document.createElement("button");
-    button.id = "reddit-grab-btn";
-    button.type = "button";
-    Object.assign(button.style, {
-      position: "absolute",
-      zIndex: "2147483647",
-      display: "none",
-      alignItems: "center",
-      gap: "6px",
-      padding: "6px 12px",
-      border: "none",
-      borderRadius: "999px",
-      background: "#d93a00",
-      color: "#fff",
-      font: "600 13px/1 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-      cursor: "pointer",
-      boxShadow: "0 2px 8px rgba(0,0,0,.35)",
-    });
-    button.textContent = "⬇︎ Save media";
-    button.addEventListener("click", onButtonClick);
-    button.addEventListener("mouseenter", () => {
-      /* keep visible while hovered */
-    });
-    document.body.appendChild(button);
-    return button;
-  }
-
-  // Pin to the bottom-right corner of the post.
-  function positionButton(postEl) {
-    const rect = postEl.getBoundingClientRect();
-    const bw = button.offsetWidth || 120;
-    const bh = button.offsetHeight || 30;
-    button.style.left = `${window.scrollX + rect.right - bw - 8}px`;
-    button.style.top = `${window.scrollY + rect.bottom - bh - 8}px`;
-  }
-
-  function showButtonFor(postEl, permalink) {
-    const btn = ensureButton();
-    currentPost = { el: postEl, permalink };
-    if (!busy) btn.textContent = "⬇︎ Save media";
-    btn.style.display = "inline-flex"; // must be visible before measuring
-    positionButton(postEl);
-  }
-
-  function hideButton() {
-    if (button && !busy) {
-      button.style.display = "none";
-      currentPost = null;
-    }
-  }
-
-  // ------------------------------------------------------------- post lookup
-
-  // Walk the composed event path (pierces shadow DOM) looking for a post
-  // container we know how to handle. Returns { el, permalink } or null.
-  function findPost(path) {
-    for (const node of path) {
-      if (!(node instanceof Element)) continue;
-
-      // New Reddit (shreddit web components)
-      if (node.tagName === "SHREDDIT-POST") {
-        const type = node.getAttribute("post-type");
-        const href = node.getAttribute("content-href") || "";
-        const isMediaType = ["gallery", "image", "gif", "video"].includes(type);
-        // Link/embed posts pointing at a gif host we can resolve
-        const isMediaHost = /giphy\.com\/(gifs|embed)|\.(gifv?|mp4|jpe?g|png|webp)(\?|$)/i.test(href);
-        if (!isMediaType && !isMediaHost) return null;
-        const permalink = node.getAttribute("permalink");
-        return permalink ? { el: node, permalink } : null;
-      }
-
-      // Old Reddit
-      if (node.classList && node.classList.contains("thing") && node.dataset.permalink) {
-        const domain = node.dataset.domain || "";
-        const url = node.dataset.url || "";
-        const isMedia =
-          domain === "i.redd.it" ||
-          domain === "preview.redd.it" ||
-          domain === "v.redd.it" ||
-          domain === "i.imgur.com" ||
-          domain.endsWith("giphy.com") ||
-          url.includes("/gallery/") ||
-          /\.(jpe?g|png|gif|gifv|webp|mp4)(\?|$)/i.test(url);
-        return isMedia ? { el: node, permalink: node.dataset.permalink } : null;
-      }
+  async function waitFor(read, attempts = 25) {
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      const value = read();
+      if (value) return value;
+      await tick();
     }
     return null;
   }
 
-  document.addEventListener(
-    "mouseover",
-    (e) => {
-      if (button && e.composedPath().includes(button)) return; // hovering our button
-      const post = findPost(e.composedPath());
-      if (post) {
-        showButtonFor(post.el, post.permalink);
-      } else {
-        hideButton();
-      }
-    },
-    true
-  );
+  // --- Post identification -------------------------------------------------
 
-  window.addEventListener(
-    "scroll",
-    () => {
-      // Reposition rather than leaving the button floating over the wrong post.
-      if (currentPost && button && button.style.display !== "none" && !busy) {
-        positionButton(currentPost.el);
-      }
-    },
-    { passive: true }
-  );
-
-  // -------------------------------------------------------------- media URLs
-
-  const MIME_EXT = {
-    "image/jpg": "jpg",
-    "image/jpeg": "jpg",
-    "image/png": "png",
-    "image/gif": "gif",
-    "image/webp": "webp",
-  };
-
-  function mediaDirectoryUrl(url) {
-    // Reddit now uses both v.redd.it/<id>/... and nested
-    // v.redd.it/link/<post>/asset/<id>/... paths. URL resolution must keep the
-    // entire directory; taking only the first path segment loses the asset ID.
-    return new URL(".", url).href;
-  }
-
-  function audioQuality(url) {
-    // Prefer the bitrate encoded in Reddit's audio filenames. Some current
-    // manifests report the same (incorrectly low) bandwidth for both the 64
-    // and 128 variants, so the Representation bandwidth is not dependable.
-    const match = url.match(/audio[^0-9]*(\d+)/i) || url.match(/(\d+)(?=\.[a-z0-9]+(?:\?|$))/i);
-    return match ? parseInt(match[1], 10) : 0;
-  }
-
-  // v.redd.it serves video and audio as separate DASH streams. Read the DASH
-  // manifest (the player fetches it cross-origin too, so CORS allows it) and
-  // pick the highest-bitrate audio track. Returns a URL or null (no audio).
-  async function findAudioUrl(videoUrl, dashUrl) {
-    let videoBase;
+  function normalizePermalink(value) {
+    if (!value) return null;
     try {
-      const parsed = new URL(videoUrl);
-      if (parsed.hostname !== "v.redd.it") return null;
-      videoBase = mediaDirectoryUrl(parsed.href);
+      const url = new URL(value, location.origin);
+      if (!/(^|\.)reddit\.com$/i.test(url.hostname)) return null;
+      const match = url.pathname.match(
+        /\/(?:r\/[^/]+\/|(?:user|u)\/[^/]+\/)?comments\/[a-z0-9]+(?:\/[^?#]*)?/i
+      );
+      return match ? match[0] : null;
     } catch {
       return null;
     }
+  }
 
-    const manifestUrl = dashUrl || new URL("DASHPlaylist.mpd", videoBase).href;
-    let mediaBase = videoBase;
-    try {
-      mediaBase = mediaDirectoryUrl(manifestUrl);
-      const res = await fetch(manifestUrl);
-      if (res.ok) {
-        const xml = await res.text();
-        const audio = [...xml.matchAll(/<BaseURL>([^<]+)<\/BaseURL>/g)]
-          .map((mm) => mm[1])
-          .filter((u) => /audio/i.test(u))
-          .sort((a, b) => audioQuality(b) - audioQuality(a));
-        // BaseURL entries are relative to the manifest, not the v.redd.it
-        // origin or its first path segment.
-        if (audio.length) return new URL(audio[0], manifestUrl).href;
-      }
-    } catch {
-      /* manifest blocked/unreachable — fall through to known URL patterns */
+  function permalinkFrom(element) {
+    const direct = [
+      element.getAttribute?.("permalink"),
+      element.dataset?.permalink,
+      element instanceof HTMLAnchorElement ? element.href : null,
+    ];
+    for (const value of direct) {
+      const permalink = normalizePermalink(value);
+      if (permalink) return permalink;
     }
 
-    // Cover both Reddit's older DASH names and its current CMAF names if the
-    // manifest cannot be read.
-    for (const name of [
-      "CMAF_AUDIO_128.mp4",
-      "CMAF_AUDIO_64.mp4",
-      "DASH_AUDIO_128.mp4",
-      "DASH_audio.mp4",
+    for (const value of [
+      element.getAttribute?.("post-id"),
+      element.getAttribute?.("thing-id"),
+      element.getAttribute?.("id"),
     ]) {
-      const candidate = new URL(name, mediaBase).href;
-      try {
-        const res = await fetch(candidate, { method: "HEAD" });
-        if (res.ok) return candidate;
-      } catch {
-        /* try next */
-      }
+      const postId = String(value || "").replace(/^t3_/i, "");
+      if (/^[a-z0-9]+$/i.test(postId)) return `/comments/${postId}`;
+    }
+
+    for (const selector of [
+      "shreddit-post[permalink]",
+      'a[href*="/comments/"]',
+      'a[data-post-click-location="comments-button"]',
+    ]) {
+      const child = element.querySelector?.(selector);
+      const value = child?.getAttribute?.("permalink") || child?.href;
+      const permalink = normalizePermalink(value);
+      if (permalink) return permalink;
     }
     return null;
   }
 
-  // Returns { files: [{ url, suffix }], subreddit, postId }.
-  async function extractMedia(post) {
-    // Crossposts carry the media on the original post.
-    if (Array.isArray(post.crosspost_parent_list) && post.crosspost_parent_list.length) {
-      const inner = await extractMedia(post.crosspost_parent_list[0]);
-      if (inner.files.length) return inner;
+  // --- Finding the overflow dropdown ---------------------------------------
+
+  // Reddit puts some of these components behind shadow roots, so a plain
+  // querySelector is not enough to reach the dropdown or its items.
+  function deepQueryAll(root, selector, found = []) {
+    found.push(...(root.querySelectorAll?.(selector) || []));
+    for (const node of root.querySelectorAll?.("*") || []) {
+      if (node.shadowRoot) deepQueryAll(node.shadowRoot, selector, found);
     }
+    return found;
+  }
 
-    const files = [];
-    const rv =
-      post.secure_media?.reddit_video ||
-      post.media?.reddit_video ||
-      post.preview?.reddit_video_preview;
+  function deepQuery(root, selector) {
+    return deepQueryAll(root, selector)[0] || null;
+  }
 
-    if (post.is_gallery && post.media_metadata) {
-      const order = post.gallery_data?.items?.map((it) => it.media_id) || Object.keys(post.media_metadata);
-      let n = 0;
-      for (const id of order) {
-        const meta = post.media_metadata[id];
-        if (!meta || meta.status !== "valid") continue;
-        const suffix = `_${String(++n).padStart(2, "0")}`;
-        if (meta.e === "AnimatedImage" && (meta.s?.gif || meta.s?.mp4)) {
-          files.push({ url: meta.s.gif || meta.s.mp4, suffix });
-        } else if (MIME_EXT[meta.m]) {
-          // i.redd.it/<id>.<ext> is the full-resolution original.
-          files.push({ url: `https://i.redd.it/${id}.${MIME_EXT[meta.m]}`, suffix });
-        } else if (meta.s?.u) {
-          files.push({ url: meta.s.u, suffix });
-        }
-      }
-    } else if (rv?.fallback_url) {
-      // v.redd.it video or "gif" — fallback_url is the highest-quality video
-      // stream (video only; audio, when present, is a separate stream).
-      const videoUrl = rv.fallback_url;
-      const mayHaveAudio = rv.has_audio === true || (rv.has_audio !== false && !rv.is_gif);
-      const audio = mayHaveAudio ? await findAudioUrl(videoUrl, rv.dash_url) : null;
-      if (audio) {
-        // Merged into a single MP4 with sound by the background muxer.
-        files.push({ mux: { video: videoUrl, audio }, suffix: "" });
+  function menuIn(host) {
+    return deepQuery(host, MENU_SELECTOR);
+  }
+
+  function triggerIn(host) {
+    for (const selector of TRIGGER_SELECTORS) {
+      const trigger = deepQuery(host, selector);
+      if (trigger) return trigger;
+    }
+    return null;
+  }
+
+  // A post header holds more than one dropdown (author and community cards use
+  // them too), so identify the overflow menu by what it contains rather than by
+  // document order. Strongest evidence first, because the menu itself is
+  // rendered lazily and is often not there yet on the first pass.
+  const HOST_TESTS = [
+    (host) => menuIn(host)?.querySelector(POST_ITEM_SELECTOR),
+    (host) => host.localName === "shreddit-post-overflow-menu",
+    (host) => deepQuery(host, 'svg[icon-name="overflow-horizontal"]'),
+  ];
+
+  function overflowHostIn(post) {
+    const candidates = [];
+    for (const selector of OVERFLOW_SELECTORS) deepQueryAll(post, selector, candidates);
+    for (const test of HOST_TESTS) {
+      const match = candidates.find(test);
+      if (match) return match;
+    }
+    // Every test above is positive evidence of the post overflow menu. A plain
+    // dropdown is not: matching one anyway parks a stray row beside the author
+    // or community card, which is worse than adding nothing here.
+    return null;
+  }
+
+  function labelOf(element) {
+    const text = element.getAttribute?.("aria-label") || element.textContent || "";
+    return text.replace(/\s+/g, " ").trim();
+  }
+
+  function isOpen(host) {
+    return triggerIn(host)?.getAttribute("aria-expanded") === "true";
+  }
+
+  // --- Moving menu items into the header -----------------------------------
+
+  // Everything but the icon is hidden, so the item reads as a round button.
+  function keepOnlyIcon(element) {
+    for (const child of element.children) {
+      if (child.localName === "svg") continue;
+      if (child.querySelector("svg")) {
+        Object.assign(child.style, {
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          width: "auto",
+          height: "auto",
+          minWidth: "0",
+          margin: "0",
+          padding: "0",
+          gap: "0",
+        });
+        keepOnlyIcon(child);
       } else {
-        files.push({ url: videoUrl, suffix: "" });
-      }
-    } else {
-      const url = post.url_overridden_by_dest || post.url || "";
-      const giphyId = url.match(/giphy\.com\/(?:gifs|embed)\/(?:[\w-]*-)?([a-zA-Z0-9]+)(?:[/?#]|$)/)?.[1];
-      if (giphyId) {
-        // i.giphy.com serves the original gif directly by ID.
-        files.push({ url: `https://i.giphy.com/${giphyId}.gif`, suffix: "" });
-      } else if (/\.gifv(\?|$)/i.test(url)) {
-        // imgur .gifv is just an mp4 behind a player page
-        files.push({ url: url.replace(/\.gifv(\?.*)?$/i, ".mp4"), suffix: "" });
-      } else if (/^https?:\/\/i\.redd\.it\//.test(url) || /\.(jpe?g|png|gif|webp|mp4)(\?|$)/i.test(url)) {
-        files.push({ url, suffix: "" });
-      } else if (post.preview?.images?.[0]?.source?.url) {
-        files.push({ url: post.preview.images[0].source.url, suffix: "" });
+        child.style.setProperty("display", "none", "important");
       }
     }
-
-    return {
-      files,
-      subreddit: post.subreddit || "reddit",
-      postId: post.id || "post",
-    };
   }
 
-  function setStatus(text) {
-    if (button && busy) button.textContent = text;
-  }
+  function compactItem(li) {
+    li.title = labelOf(li);
+    li.setAttribute(ADOPTED_ATTR, li.id);
+    Object.assign(li.style, { listStyle: "none", margin: "0", flex: "0 0 auto" });
 
-  // Reddit rate-limits the JSON endpoint per minute. On 429, wait what
-  // Retry-After asks for (falling back to exponential backoff) and retry.
-  async function fetchWithRetry(url, attempts = 3) {
-    for (let i = 0; ; i++) {
-      const res = await fetch(url, { credentials: "same-origin" });
-      if (res.status !== 429) return res;
-      if (i >= attempts - 1) {
-        throw new Error("Rate limited — wait a minute and retry");
-      }
-      const wait = Math.min(parseInt(res.headers.get("retry-after"), 10) || 5 * 2 ** i, 60);
-      for (let left = wait; left > 0; left--) {
-        setStatus(`⏳ Rate limited — retrying in ${left}s`);
-        await new Promise((r) => setTimeout(r, 1000));
-      }
-      setStatus("⏳ Fetching…");
+    const item = li.querySelector('[role="menuitem"]') || li;
+    keepOnlyIcon(item);
+    Object.assign(item.style, {
+      display: "inline-flex",
+      alignItems: "center",
+      justifyContent: "center",
+      width: BUTTON_SIZE,
+      height: BUTTON_SIZE,
+      borderRadius: "50%",
+      gap: "0",
+    });
+    // Reddit sets padding-inline-end inline on the menu item.
+    item.style.setProperty("padding", "0", "important");
+    item.style.setProperty("padding-inline-end", "0", "important");
+
+    for (const svg of li.querySelectorAll("svg")) {
+      svg.setAttribute("width", ICON_SIZE);
+      svg.setAttribute("height", ICON_SIZE);
     }
   }
 
-  async function downloadPost(permalink) {
-    const url = new URL(permalink, location.origin);
-    url.hostname = "www.reddit.com"; // old./new. subdomains serve the same JSON
-    url.pathname = url.pathname.replace(/\/$/, "") + ".json";
-    url.search = "?raw_json=1";
-
-    const res = await fetchWithRetry(url);
-    if (!res.ok) throw new Error(`Reddit returned ${res.status}`);
-    const data = await res.json();
-    const post = data?.[0]?.data?.children?.[0]?.data;
-    if (!post) throw new Error("Unexpected JSON shape");
-
-    const extracted = await extractMedia(post);
-    if (!extracted.files.length) throw new Error("No media found");
-
-    const reply = await api.runtime.sendMessage({ type: "download-images", ...extracted });
-    if (!reply?.ok) throw new Error(reply?.error || "Download failed");
-    return reply.count;
+  // `faceplate-tracker` wraps some items for analytics; it is display:contents,
+  // so taking it along keeps Reddit's tracking intact without affecting layout.
+  function outermost(li) {
+    return li.parentElement?.localName === "faceplate-tracker" ? li.parentElement : li;
   }
 
-  async function onButtonClick(e) {
-    e.preventDefault();
-    e.stopPropagation();
-    if (busy || !currentPost) return;
-    busy = true;
-    button.textContent = "⏳ Fetching…";
+  function adoptItem(row, li, before) {
+    const existing = row.querySelector(`[${ADOPTED_ATTR}="${li.id}"]`);
+    if (existing) outermost(existing).remove();
+    compactItem(li);
+    row.insertBefore(outermost(li), before);
+  }
+
+  function syncItems(row, host, before) {
+    const items = menuIn(host)?.querySelectorAll(ITEM_SELECTOR) || [];
+    if (!items.length) return false;
+    for (const li of [...items]) adoptItem(row, li, before);
+    hideTrigger(host);
+    return true;
+  }
+
+  // Once every item lives in the header the "···" button is redundant. It stays
+  // until then, so a post whose menu never renders keeps its actions reachable.
+  function hideTrigger(host) {
+    const trigger = triggerIn(host);
+    if (!trigger) return;
+    Object.assign(trigger.style, {
+      position: "absolute",
+      width: "1px",
+      height: "1px",
+      opacity: "0",
+      pointerEvents: "none",
+    });
+  }
+
+  function watchMenu(row, host, before) {
+    let adoptions = syncItems(row, host, before) ? 1 : 0;
+    // The menu does not exist on the first pass — Reddit loads it through
+    // `shreddit-async-loader` — and lit rebuilds it after some actions. Keep
+    // adopting rather than stopping at the first success, so items Reddit
+    // re-renders do not end up stranded back inside the dropdown. The cap is a
+    // runaway guard in case Reddit ever insists on putting them back.
+    const observer = new MutationObserver(() => {
+      if (!row.parentNode || adoptions >= 10) return observer.disconnect();
+      if (syncItems(row, host, before)) adoptions++;
+    });
+    observer.observe(host, { childList: true, subtree: true });
+  }
+
+  // Reddit builds a post's menu only when its dropdown is first opened, so the
+  // items have to be asked for. Open it behind an opacity clamp, take them, and
+  // close it again. Opacity rather than visibility, so nothing Reddit does
+  // depends on the menu reporting itself as hidden.
+  async function primeMenu(row, host, before) {
+    if (syncItems(row, host, before)) return;
+
+    const previous = host.getAttribute("style");
+    host.setAttribute(
+      "style",
+      `${previous ? `${previous};` : ""}opacity:0!important;pointer-events:none!important`
+    );
     try {
-      const count = await downloadPost(currentPost.permalink);
-      button.textContent = `✓ ${count} saved`;
-      button.style.background = "#0e8a16";
-    } catch (err) {
-      console.error("[Reddit Image Grab]", err);
-      button.textContent = `✕ ${err.message}`;
-      button.style.background = "#666";
+      triggerIn(host)?.click();
+      await waitFor(() => menuIn(host)?.querySelector(ITEM_SELECTOR));
+      syncItems(row, host, before);
+      if (isOpen(host)) triggerIn(host)?.click();
+      await waitFor(() => !isOpen(host), 5);
+    } finally {
+      await tick(60);
+      if (previous === null) host.removeAttribute("style");
+      else host.setAttribute("style", previous);
     }
-    setTimeout(() => {
-      busy = false;
-      if (button) {
-        button.style.background = "#d93a00";
-        hideButton();
-      }
-    }, 1800);
   }
 
-  // Toolbar icon clicked while viewing a post page: download that post.
-  api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    if (msg?.type !== "download-current") return;
-    const m = location.pathname.match(/\/(?:r|user|u)\/[^/]+\/comments\/[a-z0-9]+/i);
-    if (!m) {
-      sendResponse({ ok: false, error: "Open a post first" });
-      return;
+  // Reddit closes whichever dropdown is already open when another one opens, so
+  // priming several posts at once makes them fight. One at a time.
+  let primeQueue = Promise.resolve();
+
+  // Primed when the post scrolls into view rather than on hover: waiting for
+  // the pointer leaves most of the feed showing nothing but "Save media", and
+  // priming the whole feed up front opens far too many dropdowns at once.
+  function primeOnce(post, row, host, before) {
+    let observer = null;
+    let started = false;
+
+    const start = () => {
+      if (started) return;
+      started = true;
+      observer?.disconnect();
+      post.removeEventListener("pointerenter", start);
+      primeQueue = primeQueue.then(() => primeMenu(row, host, before)).catch(() => {});
+    };
+
+    if (typeof IntersectionObserver === "function") {
+      observer = new IntersectionObserver((entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) start();
+      });
+      observer.observe(post);
     }
-    downloadPost(m[0])
-      .then((count) => sendResponse({ ok: true, count }))
-      .catch((err) => sendResponse({ ok: false, error: err.message }));
-    return true; // async response
+    // Hover still counts, in case the post is already on screen and the
+    // intersection callback has not run yet.
+    post.addEventListener("pointerenter", start);
+  }
+
+  // --- Save media ----------------------------------------------------------
+
+  // Built as real nodes rather than innerHTML so the row still renders if
+  // Reddit ever enforces Trusted Types on the page.
+  function downloadIcon() {
+    const root = document.createElementNS(SVG_NS, "svg");
+    for (const [name, value] of Object.entries({
+      viewBox: "0 0 24 24",
+      width: ICON_SIZE,
+      height: ICON_SIZE,
+      fill: "none",
+      stroke: "currentColor",
+      "stroke-width": "2",
+      "stroke-linecap": "round",
+      "stroke-linejoin": "round",
+      "aria-hidden": "true",
+    })) {
+      root.setAttribute(name, value);
+    }
+    for (const d of [
+      "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4",
+      "M7 10l5 5 5-5",
+      "M12 15V3",
+    ]) {
+      const path = document.createElementNS(SVG_NS, "path");
+      path.setAttribute("d", d);
+      root.appendChild(path);
+    }
+    return root;
+  }
+
+  function createSaveMediaButton(permalink) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.title = SAVE_MEDIA_LABEL;
+    button.setAttribute("aria-label", SAVE_MEDIA_LABEL);
+    Object.assign(button.style, {
+      display: "inline-flex",
+      alignItems: "center",
+      justifyContent: "center",
+      flex: "0 0 auto",
+      width: BUTTON_SIZE,
+      height: BUTTON_SIZE,
+      padding: "0",
+      margin: "0",
+      border: "0",
+      borderRadius: "50%",
+      background: "transparent",
+      color: "currentColor",
+      cursor: "pointer",
+      lineHeight: "0",
+    });
+    button.appendChild(downloadIcon());
+
+    let busy = false;
+    let resetTimer = null;
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (busy) return;
+      busy = true;
+      clearTimeout(resetTimer);
+      button.title = "Preparing…";
+      button.style.color = "#d93900";
+
+      try {
+        const result = await downloadPost(permalink, (status) => {
+          button.title = status;
+        });
+        button.title = result.failed
+          ? `${result.saved} saved, ${result.failed} failed`
+          : result.separateAudio
+            ? "Saved video + separate audio"
+            : `${result.saved} saved`;
+        button.style.color = result.failed || result.separateAudio ? "#9a6700" : "#16833b";
+      } catch (error) {
+        console.error("[Reddit Media Grab]", error);
+        button.title = error.message;
+        button.style.color = "#d93900";
+      }
+
+      resetTimer = setTimeout(() => {
+        busy = false;
+        button.title = SAVE_MEDIA_LABEL;
+        button.style.color = "currentColor";
+      }, 2600);
+    });
+
+    return button;
+  }
+
+  // --- Injection -----------------------------------------------------------
+
+  // The "···" is boxed in by wrappers sized to exactly one icon — Reddit's
+  // `shreddit-async-loader` around it is `w-xl h-xl`. A row inserted as its
+  // sibling overflows that box instead of sitting in the credit bar. Climb out
+  // of any wrapper that exists solely to hold the button and insert before the
+  // outermost one, which lands the row in the bar's trailing flex group next
+  // to the join button, where there is room to grow.
+  // Never climbs past the post: the row has to land inside it, because a row
+  // outside is a row `decorate` cannot see, and it would re-inject on every
+  // rescan.
+  function insertionAnchor(node, post) {
+    for (let depth = 0; depth < 4; depth++) {
+      const parent = node.parentNode;
+      if (!parent?.parentNode || parent === post || parent.children?.length !== 1) break;
+      node = parent;
+    }
+    return node;
+  }
+
+  // Anchor to the share button rather than to the action bar element. The bar
+  // is a wrapper around the button row, so appending to it drops the icons onto
+  // their own line underneath instead of continuing the row.
+  function actionBarInsertFor(post) {
+    for (const selector of SHARE_SELECTORS) {
+      const button = deepQuery(post, selector);
+      if (!button) continue;
+      const anchor = insertionAnchor(button, post);
+      if (anchor.parentNode) {
+        return (row) => anchor.parentNode.insertBefore(row, anchor.nextSibling);
+      }
+    }
+    for (const selector of ACTION_BAR_SELECTORS) {
+      const bar = deepQuery(post, selector);
+      if (bar) return (row) => bar.appendChild(row);
+    }
+    return null;
+  }
+
+  function injectionPointFor(post) {
+    const host = overflowHostIn(post);
+    const insert = actionBarInsertFor(post);
+    if (insert) return { host, insert };
+    // Fall back to the credit bar. It is cramped — the "···" is boxed in by
+    // wrappers sized to exactly one icon — so climb out of any wrapper holding
+    // nothing but the button, rather than inserting as its sibling.
+    if (host?.parentNode) {
+      const anchor = insertionAnchor(host, post);
+      return { host, insert: (row) => anchor.parentNode.insertBefore(row, anchor) };
+    }
+    // Old Reddit has no overflow dropdown, only its inline action list. There
+    // is nothing to move there, but "Save media" still applies.
+    const buttons = post.querySelector?.(".flat-list.buttons");
+    if (buttons) return { host: null, insert: (row) => buttons.appendChild(row) };
+    return null;
+  }
+
+  function decorate(post) {
+    // The row already being in the post is the only thing that suppresses a
+    // second one. Reddit nests `shreddit-post` and `article`, so a post matches
+    // POST_SELECTOR twice; marking the dropdown instead would both miss the
+    // case where the emptied menu makes the second pass pick a neighbouring
+    // dropdown, and permanently suppress the row if Reddit ever re-renders the
+    // credit bar out from under it.
+    if (post.querySelector(".reddit-media-grab-actions")) return;
+    const permalink = permalinkFrom(post);
+    if (!permalink) return;
+    const point = injectionPointFor(post);
+    if (!point) return;
+
+    const row = document.createElement("span");
+    row.className = "reddit-media-grab-actions";
+    Object.assign(row.style, {
+      display: "inline-flex",
+      alignItems: "center",
+      flex: "0 0 auto",
+      gap: "0px",
+      // Reddit covers the whole card with `a[slot=full-post-link].absolute
+      // .inset-0`, which paints over static content and swallows the click,
+      // navigating to the post. Its own controls sit above that overlay by
+      // being positioned; do the same rather than fighting the click.
+      position: "relative",
+      // Pushes the row to the end of the action bar, leaving the gap between
+      // it and the vote/comment/share group. An auto margin does this without
+      // touching Reddit's own container styles, and collapses harmlessly to 0
+      // if that container turns out not to be full width.
+      marginInlineStart: "auto",
+      padding: "0",
+      whiteSpace: "nowrap",
+      verticalAlign: "middle",
+    });
+
+    // Save media stays last; adopted items are inserted before it.
+    const saveMedia = createSaveMediaButton(permalink);
+    row.appendChild(saveMedia);
+    point.insert(row);
+
+    if (point.host) {
+      watchMenu(row, point.host, saveMedia);
+      primeOnce(post, row, point.host, saveMedia);
+    }
+  }
+
+  function scan() {
+    for (const post of document.querySelectorAll(POST_SELECTOR)) decorate(post);
+  }
+
+  let scanQueued = false;
+  function queueScan() {
+    if (scanQueued) return;
+    scanQueued = true;
+    setTimeout(() => {
+      scanQueued = false;
+      scan();
+    }, 150);
+  }
+
+  scan();
+  new MutationObserver(queueScan).observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+  });
+
+  // --- Download ------------------------------------------------------------
+
+  function mediaModule() {
+    if (!globalThis.RedditGrabMedia) throw new Error("Media extractor did not load");
+    return globalThis.RedditGrabMedia;
+  }
+
+  async function fetchWithRetry(url, onStatus, attempts = 3) {
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      const response = await fetch(url, { credentials: "same-origin" });
+      if (response.status !== 429) return response;
+      if (attempt === attempts - 1) throw new Error("Reddit rate limit reached — try again shortly");
+      const delay = Math.min(Number(response.headers.get("retry-after")) || 4 * 2 ** attempt, 30);
+      for (let remaining = delay; remaining > 0; remaining--) {
+        onStatus?.(`Retrying in ${remaining}s…`);
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    }
+    throw new Error("Unable to load the Reddit post");
+  }
+
+  async function downloadPost(permalink, onStatus) {
+    const media = mediaModule();
+    const response = await fetchWithRetry(
+      media.redditJsonUrl(permalink, location.origin),
+      onStatus
+    );
+    if (!response.ok) throw new Error(`Reddit returned ${response.status}`);
+    const listing = await response.json();
+    const post = listing?.[0]?.data?.children?.[0]?.data;
+    if (!post) throw new Error("Reddit returned an unexpected response");
+
+    const job = media.extractMedia(post);
+    if (!job.items.length) throw new Error("This post has no downloadable media");
+
+    const result = await api.runtime.sendMessage({ type: "download-media", job });
+    if (!result?.ok) throw new Error(result?.error || "Download failed");
+    return result;
+  }
+
+  api.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type !== "download-current-post") return undefined;
+    const permalink = normalizePermalink(location.pathname);
+    if (!permalink) {
+      sendResponse({ ok: false, error: "Open a Reddit post first" });
+      return undefined;
+    }
+    downloadPost(permalink)
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
   });
 })();

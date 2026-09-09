@@ -1,14 +1,17 @@
 {
   "manifest_version": 3,
-  "name": "Reddit Image Grab",
-  "version": "1.0.1",
-  "description": "One click downloads every image in a Reddit gallery post to a folder you choose.",
+  "name": "Reddit Media Grab",
+  "version": "2.0.0",
+  "description": "Download Reddit images, galleries, GIFs, and videos with audio.",
   "permissions": [
     "downloads",
     "storage",
-    "offscreen"
+    "activeTab",
+    "scripting"
   ],
   "host_permissions": [
+    "*://reddit.com/*",
+    "*://*.reddit.com/*",
     "*://v.redd.it/*"
   ],
   "content_security_policy": {
@@ -17,31 +20,40 @@
   "browser_specific_settings": {
     "gecko": {
       "id": "reddit-grab@talix.dev",
-      "strict_min_version": "115.0"
+      "strict_min_version": "140.0",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    },
+    "gecko_android": {
+      "strict_min_version": "142.0"
     }
   },
   "background": {
-    "service_worker": "background.js",
     "scripts": [
+      "reddit-media.js",
       "background.js"
     ]
   },
   "content_scripts": [
     {
       "matches": [
-        "*://www.reddit.com/*",
-        "*://old.reddit.com/*",
-        "*://new.reddit.com/*",
-        "*://sh.reddit.com/*"
+        "*://reddit.com/*",
+        "*://*.reddit.com/*"
       ],
       "js": [
-        "content.js"
+        "reddit-media.js",
+        "content.js",
+        "reddit-feeds.js",
+        "custom-feeds.js"
       ],
       "run_at": "document_idle"
     }
   ],
   "action": {
-    "default_title": "Download images from this Reddit post"
+    "default_title": "Download media from this Reddit post"
   },
   "options_ui": {
     "page": "options.html",

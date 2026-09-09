@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011">
+  <BaseURL>streams/</BaseURL>
+  <Period>
+    <AdaptationSet contentType="video" mimeType="video/mp4" codecs="avc1.640028">
+      <Representation id="720" bandwidth="2500000">
+        <BaseURL>DASH_720.mp4?token=video-low&amp;x=1</BaseURL>
+      </Representation>
+      <Representation id="1080" bandwidth="5000000">
+        <BaseURL>DASH_1080.mp4?token=video-high&amp;x=1</BaseURL>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" codecs="mp4a.40.2">
+      <BaseURL>audio/</BaseURL>
+      <Representation id="audio-64" bandwidth="64000">
+        <BaseURL>CMAF_AUDIO_64.mp4?token=audio-low&amp;x=1</BaseURL>
+      </Representation>
+      <Representation id="audio-128" bandwidth="128000">
+        <BaseURL>CMAF_AUDIO_128.mp4?token=audio-high&amp;x=1</BaseURL>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>

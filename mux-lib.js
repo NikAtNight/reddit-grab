@@ -1,48 +1,52 @@
-// Reddit Image Grab — ffmpeg.wasm muxing. Merges a v.redd.it video stream and
-// its separate audio stream into one MP4 (stream copy, no re-encode).
-// Runs in an extension page context: the offscreen document on Chrome, the
-// background event page on Firefox. Not usable from a service worker (the
-// ffmpeg wrapper needs Worker + blob URLs).
+// Losslessly combines Reddit's separate MP4 video and audio streams.
 
 import { FFmpeg } from "./vendor/ffmpeg/index.js";
 
-const runtime = (typeof browser !== "undefined" ? browser : chrome).runtime;
+const api = typeof browser !== "undefined" ? browser : chrome;
 
-async function fetchBytes(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`fetch ${res.status} for ${new URL(url).pathname}`);
-  return new Uint8Array(await res.arrayBuffer());
+async function fetchBytes(url, label) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${label} stream returned ${response.status}`);
+  return new Uint8Array(await response.arrayBuffer());
 }
 
-// Returns a blob: URL for the muxed MP4. Caller must revoke it when done.
 export async function muxToBlobUrl(videoUrl, audioUrl) {
-  const [video, audio] = await Promise.all([fetchBytes(videoUrl), fetchBytes(audioUrl)]);
-
+  const [videoBytes, audioBytes] = await Promise.all([
+    fetchBytes(videoUrl, "Video"),
+    fetchBytes(audioUrl, "Audio"),
+  ]);
   const ffmpeg = new FFmpeg();
+
   try {
     await ffmpeg.load({
-      coreURL: runtime.getURL("vendor/core/ffmpeg-core.js"),
-      wasmURL: runtime.getURL("vendor/core/ffmpeg-core.wasm"),
+      coreURL: api.runtime.getURL("vendor/core/ffmpeg-core.js"),
+      wasmURL: api.runtime.getURL("vendor/core/ffmpeg-core.wasm"),
     });
-    await ffmpeg.writeFile("v.mp4", video);
-    await ffmpeg.writeFile("a.mp4", audio);
-    const code = await ffmpeg.exec([
-      "-i", "v.mp4",
-      "-i", "a.mp4",
-      "-map", "0:v:0",
-      "-map", "1:a:0",
-      "-c", "copy",
-      "out.mp4",
+    await ffmpeg.writeFile("video.mp4", videoBytes);
+    await ffmpeg.writeFile("audio.mp4", audioBytes);
+    const exitCode = await ffmpeg.exec([
+      "-i",
+      "video.mp4",
+      "-i",
+      "audio.mp4",
+      "-map",
+      "0:v:0",
+      "-map",
+      "1:a:0",
+      "-c",
+      "copy",
+      "-movflags",
+      "+faststart",
+      "output.mp4",
     ]);
-    if (code !== 0) throw new Error(`ffmpeg exited with ${code}`);
-    const out = await ffmpeg.readFile("out.mp4");
-    return URL.createObjectURL(new Blob([out], { type: "video/mp4" }));
+    if (exitCode !== 0) throw new Error(`ffmpeg exited with status ${exitCode}`);
+    const output = await ffmpeg.readFile("output.mp4");
+    return URL.createObjectURL(new Blob([output], { type: "video/mp4" }));
   } finally {
-    // Free the ~wasm heap; a fresh instance is loaded per mux.
     try {
       ffmpeg.terminate();
     } catch {
-      /* never loaded */
+      // Loading may have failed before the worker was created.
     }
   }
 }

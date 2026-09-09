@@ -1,0 +1,4 @@
+@ffmpeg/core 0.12.10
+SPDX-License-Identifier: GPL-2.0-or-later
+https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+Source: https://github.com/ffmpegwasm/ffmpeg.wasm
