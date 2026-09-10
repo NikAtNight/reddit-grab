@@ -5,7 +5,9 @@
   globalThis.__redditGrabFeedsLoaded = true;
 
   const { targetFromUrl, contains, createClient } = globalThis.RedditGrabFeeds;
-  const client = createClient();
+  const extensionApi = globalThis.browser || globalThis.chrome;
+  const extensionStorage = extensionApi?.storage?.local;
+  const client = createClient(globalThis.RedditGrabRequests?.fetch || globalThis.fetch.bind(globalThis), extensionStorage);
   const host = document.createElement("div");
   host.id = "reddit-grab-custom-feeds";
   const root = host.attachShadow({ mode: "open" });
@@ -47,6 +49,7 @@
     .meta { display: block; color: var(--muted); font-size: 12px; }
     .action { align-self: center; white-space: nowrap; font-size: 12px; }
     #status { margin: 10px 0 0; overflow-wrap: anywhere; }
+    #cache-status, #request-status { margin: 8px 0 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
     #retry { margin-top: 10px; padding: 6px 12px; border: 1px solid var(--border);
       border-radius: 8px; color: var(--text); background: var(--surface); }
     @media (prefers-color-scheme: dark) {
@@ -90,6 +93,10 @@
   status.id = "status";
   status.setAttribute("role", "status");
   status.setAttribute("aria-live", "polite");
+  const cacheStatus = element("p", "", panel);
+  cacheStatus.id = "cache-status";
+  const requestStatus = element("p", "", panel);
+  requestStatus.id = "request-status";
   const retry = button("Reload feeds", panel);
   retry.id = "retry";
   retry.hidden = true;
@@ -108,6 +115,12 @@
   let loading = false;
   let membership = null;
   let membershipError = "";
+  let cachedOwner = null;
+  let snapshot = null;
+  let cooldownUntil = 0;
+  let requestState = null;
+  let statusTimer;
+  let cacheUpdatePending = false;
   let lookup = null;
   let lookupTimer;
   let currentUrl = null;
@@ -124,8 +137,9 @@
 
   function postCommunity(post) {
     const name = (post?.getAttribute("subreddit-name") ||
-      post?.getAttribute("subreddit-prefixed-name")?.replace(/^r\//i, "") || "").toLowerCase();
-    return /^[a-z0-9_]{2,21}$/i.test(name) ? name : null;
+      post?.getAttribute("subreddit-prefixed-name") || "").toLowerCase()
+      .replace(/^r\//, "").replace(/^u\//, "u_");
+    return /^(?:[a-z0-9_]{2,21}|u_[a-z0-9_-]{3,20})$/i.test(name) ? name : null;
   }
 
   function updatePostJoins() {
@@ -134,10 +148,12 @@
     function inspect(container, community) {
       for (const node of container.children) {
         if (node.matches("shreddit-post")) continue;
-        if (node.matches('shreddit-join-button, button[data-post-click-location="join"]')) {
+        const isFollow = community.startsWith("u_") && node.matches(
+          'follow-button, shreddit-follow-button, button[data-testid="follow-button"], button[data-post-click-location="follow"]');
+        if (isFollow || node.matches('shreddit-join-button, button[data-post-click-location="join"]')) {
           const control = node.shadowRoot?.querySelector("button") || node;
-          const subscribed = node.getAttribute("is-subscribed");
-          if (subscribed !== "true" && subscribed !== "" && !/^joined$/i.test(control.textContent.trim())) {
+          const subscribed = node.getAttribute(isFollow ? "is-following" : "is-subscribed");
+          if (subscribed !== "true" && subscribed !== "" && !/^(joined|following|unfollow)$/i.test(control.textContent.trim())) {
             matching.set(node, community);
           }
           continue;
@@ -178,7 +194,8 @@
       }
       const { replacement } = hiddenJoins.get(node);
       replacement.dataset.community = community;
-      replacement.setAttribute("aria-label", `Add r/${community} to a custom feed`);
+      const label = community.startsWith("u_") ? `u/${community.slice(2)}` : `r/${community}`;
+      replacement.setAttribute("aria-label", `Add ${label} to a custom feed`);
       if (node.hasAttribute("slot")) replacement.setAttribute("slot", node.getAttribute("slot"));
       else replacement.removeAttribute("slot");
       replacement.hidden = feedNames.has(community);
@@ -197,7 +214,7 @@
       for (const root of roots) {
         observedRoots.add(root);
         joinObserver.observe(root, { childList: true, subtree: true, attributes: true,
-          attributeFilter: ["subreddit-name", "subreddit-prefixed-name", "data-post-click-location", "is-subscribed"] });
+          attributeFilter: ["subreddit-name", "subreddit-prefixed-name", "data-post-click-location", "data-testid", "is-subscribed", "is-following"] });
       }
     }
   }
@@ -216,29 +233,83 @@
     launcher.title = membership === null
       ? membershipError || "Checking your custom feeds"
       : count ? `Already in: ${membership.map((feed) => feed.label).join(", ")}` : "Not in any of your custom feeds";
+    if (cachedOwner && membership !== null) launcher.title += ` · Saved feeds for u/${cachedOwner}`;
     launcher.setAttribute("aria-label", `${target?.label || "Current page"}: ${launcher.textContent}. ${launcher.title}. Open feed picker`);
   }
 
-  function loadMembership(selected) {
+  function networkPaused() {
+    return navigator.onLine === false || Date.now() < cooldownUntil;
+  }
+
+  function renderCacheStatus() {
+    if (snapshot?.user) {
+      const synced = Number.isFinite(snapshot.savedAt) ? new Date(snapshot.savedAt).toLocaleString() : "unknown";
+      const lines = [`Saved feeds for u/${snapshot.user}. Last full sync: ${synced}.`];
+      if (Number.isFinite(snapshot.updatedAt) && snapshot.updatedAt > snapshot.savedAt) {
+        lines.push(`Local update: ${new Date(snapshot.updatedAt).toLocaleString()}.`);
+      }
+      lines.push("Reload feeds to include changes made outside this extension.");
+      cacheStatus.textContent = lines.join(" ");
+    } else {
+      cacheStatus.textContent = "No saved feeds yet.";
+    }
+    renderRequestStatus();
+  }
+
+  function renderRequestStatus() {
+    const messages = [];
+    if (navigator.onLine === false) messages.push(snapshot?.user ? "Offline. Showing saved feeds." : "Offline.");
+    const seconds = Math.max(0, Math.ceil((cooldownUntil - Date.now()) / 1000));
+    if (seconds) {
+      const duration = seconds >= 60 ? `${Math.floor(seconds / 60)}m ${seconds % 60}s` : `${seconds}s`;
+      messages.push(`Reddit requests paused for ${duration}. Saved feeds remain available.`);
+    } else if (requestState?.queued || requestState?.inFlight) {
+      messages.push(`Reddit requests: ${Number(requestState.inFlight) || 0} running, ${Number(requestState.queued) || 0} waiting.`);
+    }
+    requestStatus.textContent = messages.join(" ");
+    requestStatus.hidden = !messages.length;
+    retry.disabled = busy || loading || networkPaused();
+    for (const row of list.querySelectorAll(".feed")) {
+      row.disabled = busy || loading || networkPaused() || row.dataset.unavailable === "true";
+    }
+  }
+
+  async function readRequestState() {
+    try {
+      const values = await extensionStorage?.get(["redditGrabFeedCooldown", "redditGrabRequestStatus"]);
+      cooldownUntil = Number(values?.redditGrabFeedCooldown) || 0;
+      requestState = values?.redditGrabRequestStatus || null;
+    } catch { /* Keep the last observed status if extension storage is unavailable. */ }
+    renderRequestStatus();
+  }
+
+  function loadMembership(selected, refresh = false, cachedOnly = false) {
     clearTimeout(lookupTimer);
-    if (lookup && lookup.label === (selected?.label || null)) return lookup.promise;
+    if (!refresh && lookup && lookup.label === (selected?.label || null) && lookup.cachedOnly === cachedOnly) return lookup.promise;
     membershipError = "";
     renderLauncher();
-    const job = { label: selected?.label || null, url: location.href };
+    const job = { label: selected?.label || null, url: location.href, cachedOnly };
     lookup = job;
-    job.promise = client.open(selected).then((result) => {
+    job.promise = client.open(selected, { refresh, cachedOnly }).then((result) => {
       if (lookup === job && location.href === job.url) {
+        snapshot = result.cacheMissing ? null : result;
+        cachedOwner = result.user;
         updateFeedNames(result.feeds);
-        membership = target ? result.feeds.filter((feed) => contains(feed, target)) : [];
+        membership = result.cacheMissing ? null : target ? result.feeds.filter((feed) => contains(feed, target)) : [];
+        membershipError = result.cacheMissing ? "No saved feeds yet. Open the picker to load them from Reddit." : "";
         renderLauncher();
+        renderCacheStatus();
       }
       return result;
     }).catch((error) => {
       if (lookup === job && location.href === job.url) {
+        snapshot = null;
+        cachedOwner = null;
         membership = null;
         membershipError = error.message;
         updateFeedNames();
         renderLauncher();
+        renderCacheStatus();
       }
       throw error;
     }).finally(() => {
@@ -249,6 +320,7 @@
 
   function closePanel(focus = true) {
     panel.hidden = true;
+    clearInterval(statusTimer);
     pickerTarget = null;
     host.hidden = !target;
     launcher.setAttribute("aria-expanded", "false");
@@ -263,8 +335,8 @@
   function renderFeeds() {
     list.replaceChildren();
     search.disabled = loading;
-    retry.disabled = busy || loading;
-    if (!session || !pickerTarget) return;
+    renderRequestStatus();
+    if (!session || session.cacheMissing || !pickerTarget) return;
     const query = search.value.trim().toLowerCase();
     const feeds = session.feeds.filter((feed) => feed.label.toLowerCase().includes(query));
     for (const feed of feeds) {
@@ -276,14 +348,15 @@
       element("span", feed.label, label).className = "name";
       element("span", `${feed.visibility} · ${feed.names.length}/100`, label).className = "meta";
       element("span", present ? "Added ✓" : full ? "Full" : "Add +", row).className = "action";
-      row.disabled = busy || loading || present || full;
+      row.dataset.unavailable = String(present || full);
+      row.disabled = busy || loading || networkPaused() || present || full;
       row.setAttribute("aria-label", `${present ? "Already in" : "Add to"} ${feed.label}, ${feed.visibility}${full ? ", full" : ""}`);
       row.addEventListener("click", () => add(feed));
     }
     if (!feeds.length) element("p", session.feeds.length ? "No matching feeds." : "No custom feeds yet. Create one in Reddit's Custom Feeds section, then reload here.", list);
   }
 
-  async function openPanel(selected, opener) {
+  async function openPanel(selected, opener, refresh = false) {
     syncTarget();
     selected ||= pickerTarget || target;
     opener ||= pickerOpener;
@@ -293,6 +366,8 @@
     host.hidden = false;
     const ticket = ++generation;
     panel.hidden = false;
+    clearInterval(statusTimer);
+    statusTimer = setInterval(renderRequestStatus, 1000);
     launcher.setAttribute("aria-expanded", "true");
     targetLabel.textContent = selected.label;
     search.value = "";
@@ -301,12 +376,17 @@
     retry.hidden = true;
     status.textContent = "Loading your feeds…";
     renderFeeds();
+    renderCacheStatus();
     close.focus();
     try {
-      const result = await loadMembership(selected);
+      await readRequestState();
+      if (ticket !== generation) return;
+      const result = await loadMembership(selected, refresh, networkPaused());
       if (ticket !== generation) return;
       session = result;
-      status.textContent = busy ? "Finishing the previous add…" : "Choose a feed to add this " + selected.kind + ".";
+      status.textContent = result.warning || (result.cacheMissing
+        ? "Connect to Reddit and reload to save your feeds."
+        : busy ? "Finishing the previous add…" : `Choose a feed for this ${selected.kind}.`);
     } catch (error) {
       if (ticket === generation) status.textContent = error.message;
     } finally {
@@ -315,13 +395,14 @@
         retry.hidden = false;
         renderFeeds();
         if (session) search.focus();
+        refreshSavedMembership();
       }
     }
   }
 
   async function add(feed) {
     syncTarget();
-    if (busy || loading || !session || !pickerTarget) return;
+    if (busy || loading || networkPaused() || !session || !pickerTarget) return;
     const selected = pickerTarget;
     const url = location.href;
     const ticket = generation;
@@ -343,6 +424,9 @@
       }
       if (!isCurrent()) return;
       session.feeds = session.feeds.map((item) => item.path === feed.path ? result.feed : item);
+      session.updatedAt = result.updatedAt || Date.now();
+      snapshot = session;
+      renderCacheStatus();
       status.textContent = `${selected.label} ${result.alreadyPresent ? "is already in" : "was added to"} ${feed.label}.`;
     } catch (error) {
       if (location.href === url) {
@@ -360,6 +444,7 @@
       } else {
         renderFeeds();
         if (isCurrent()) search.focus();
+        refreshSavedMembership();
       }
     }
   }
@@ -381,7 +466,7 @@
       // Posts need the feed list even on pages with no floating launcher.
       const selected = target;
       lookupTimer = setTimeout(() => {
-        loadMembership(selected).catch(() => {});
+        loadMembership(selected, false, true).catch(() => {});
       }, 350);
     }
     if (!host.isConnected && document.body) document.body.append(host);
@@ -389,16 +474,39 @@
 
   function refreshMembership() {
     syncTarget();
-    if (busy || loading || document.hidden) return;
+    if (busy || loading || document.hidden || !panel.hidden) return;
     clearTimeout(lookupTimer);
     const selected = target;
     const url = location.href;
     lookupTimer = setTimeout(() => {
       if (location.href !== url || busy || loading) return;
-      if (panel.hidden) loadMembership(selected).catch(() => {});
-      else openPanel();
+      if (panel.hidden) loadMembership(selected, false, true).catch(() => {});
     }, 350);
   }
+
+  function refreshSavedMembership() {
+    if (!cacheUpdatePending || busy || loading) return;
+    cacheUpdatePending = false;
+    const ticket = generation;
+    loadMembership(pickerTarget || target, false, true).then(result => {
+      if (ticket !== generation || panel.hidden || busy || loading) return;
+      session = result;
+      renderFeeds();
+    }).catch(() => {});
+  }
+
+  extensionApi?.storage?.onChanged?.addListener((changes, area) => {
+    if (area !== "local") return;
+    if (changes.redditGrabFeedCooldown) cooldownUntil = Number(changes.redditGrabFeedCooldown.newValue) || 0;
+    if (changes.redditGrabRequestStatus) requestState = changes.redditGrabRequestStatus.newValue || null;
+    renderRequestStatus();
+    if (Object.keys(changes).some(key => key === "redditGrabFeedCache" || key.startsWith("redditGrabFeed:"))) {
+      cacheUpdatePending = true;
+      refreshSavedMembership();
+    }
+  });
+  window.addEventListener("online", renderRequestStatus);
+  window.addEventListener("offline", renderRequestStatus);
 
   // Capture before Reddit's post handlers; delegation survives replaced buttons.
   document.addEventListener("click", (event) => {
@@ -413,7 +521,9 @@
     syncTarget();
     updatePostJoins();
     if (feedNames.has(name)) return;
-    openPanel({ name, subredditName: name, label: `r/${name}`, kind: "community" }, replacement);
+    const profile = name.startsWith("u_");
+    openPanel({ name: profile ? name.slice(2) : name, subredditName: name,
+      label: profile ? `u/${name.slice(2)}` : `r/${name}`, kind: profile ? "profile" : "community" }, replacement);
   }, true);
 
   launcher.addEventListener("click", () => {
@@ -422,7 +532,9 @@
     else closePanel();
   });
   close.addEventListener("click", () => closePanel());
-  retry.addEventListener("click", () => openPanel());
+  retry.addEventListener("click", () => {
+    if (!busy && !loading && !networkPaused()) openPanel(undefined, undefined, true);
+  });
   search.addEventListener("input", renderFeeds);
   root.addEventListener("keydown", (event) => {
     if (event.key === "Escape") { event.stopPropagation(); closePanel(); }

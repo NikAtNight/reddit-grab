@@ -4,7 +4,34 @@ if (!globalThis.RedditGrabMedia && typeof importScripts === "function") {
   importScripts("reddit-media.js");
 }
 
+if (!globalThis.RedditGrabRequests && typeof importScripts === "function") importScripts("reddit-requests.js");
+if (!globalThis.RedditGrabRecovery && typeof importScripts === "function") importScripts("download-recovery.js");
+
 const api = typeof browser !== "undefined" ? browser : chrome;
+const requestBroker = globalThis.RedditGrabRequests.createBroker({
+  storage: api.storage.local,
+  execute: async (request, context) => {
+    const result = await api.tabs.sendMessage(context.tabId, { type: "reddit-grab-execute-request", request }, { frameId: 0 });
+    if (!result?.ok) throw new Error(result?.error || "The Reddit tab closed or reloaded before the request finished");
+    return result.value;
+  },
+});
+const recovery = globalThis.RedditGrabRecovery.create({
+  storage: api.storage.local,
+  retry: async (job, { recoveryId }) => {
+    if (job.items[0].kind !== "post") return downloadJob(job, recoveryId);
+    const url = new URL(job.items[0].url);
+    const tabs = await api.tabs.query({ url: `${url.origin}/*` });
+    const source = job.sourceTab;
+    const eligible = tabs.filter(tab => !source || (Boolean(tab.incognito) === source.incognito &&
+      (source.cookieStoreId ? tab.cookieStoreId === source.cookieStoreId : typeof browser === "undefined" || tab.id === source.id)));
+    const tab = eligible.find(item => item.id === source?.id) || eligible.find(item => item.active) || eligible[0];
+    if (!tab?.id) throw new Error(source && !source.cookieStoreId && typeof browser !== "undefined"
+      ? "The original Reddit tab is unavailable. Reopen the post and use Save media there."
+      : "Open a Reddit tab in the original browser container, then retry this download.");
+    return api.tabs.sendMessage(tab.id, { type: "retry-download-post", permalink: url.pathname, recoveryId }, { frameId: 0 });
+  },
+});
 const DEFAULTS = { folder: "Reddit Media", bySubreddit: false };
 const blobDownloads = new Map();
 let pendingBlobDownloads = 0;
@@ -117,9 +144,10 @@ async function releaseBlob(blobUrl) {
   }
 }
 
-api.downloads.onChanged.addListener(async ({ id, state }) => {
+api.downloads.onChanged.addListener(async ({ id, state, error }) => {
   if (!state) return;
   if (state.current !== "complete" && state.current !== "interrupted") return;
+  await recovery.changed({ id, state, error }).catch(() => undefined);
   if (!blobDownloads.has(id)) {
     await recoverStaleOffscreen();
     return;
@@ -208,7 +236,20 @@ async function resolveItem(item) {
   throw new Error(`Unsupported media type: ${item.kind}`);
 }
 
-async function downloadJob(job) {
+async function reconcileTransfer(id) {
+  const [download] = await api.downloads.search({ id });
+  if (!download || ["complete", "interrupted"].includes(download.state)) {
+    await recovery.changed({ id, state: { current: download?.state || "interrupted" },
+      error: { current: download?.error || "The browser no longer has this download. Check your files before retrying." } });
+  }
+}
+
+async function recordDownloadFailure(job, item, error, recoveryId) {
+  try { await recovery.recordFailure(job, item, error, recoveryId); }
+  catch { console.warn("[Reddit Media Grab] could not save download recovery"); }
+}
+
+async function downloadJob(job, recoveryId) {
   const settings = await api.storage.sync.get(DEFAULTS);
   const folders = [];
   const configuredFolder = safeFolder(settings.folder);
@@ -221,16 +262,22 @@ async function downloadJob(job) {
   let failed = 0;
   let separateAudio = 0;
 
-  async function save(url, suffix = "", ext) {
+  async function save(url, suffix = "", ext, sourceItem) {
     const filename = `${prefix}${baseName}${suffix}.${ext || extensionFromUrl(url, "bin")}`;
-    return api.downloads.download({ url, filename, conflictAction: "uniquify", saveAs: false });
+    const id = await api.downloads.download({ url, filename, conflictAction: "uniquify", saveAs: false });
+    // A storage failure must not repeat a download already accepted by the browser.
+    try {
+      await recovery.recordStarted(id, job, sourceItem, recoveryId);
+      await reconcileTransfer(id);
+    } catch { console.warn("[Reddit Media Grab] could not track browser download"); }
+    return id;
   }
 
   for (const sourceItem of job.items) {
     try {
       const item = await resolveItem(sourceItem);
       if (item.kind !== "mux") {
-        await save(item.url, item.suffix, item.ext || item.extHint);
+        await save(item.url, item.suffix, item.ext || item.extHint, sourceItem);
         saved++;
         continue;
       }
@@ -241,7 +288,7 @@ async function downloadJob(job) {
       pendingBlobDownloads++;
       try {
         blobUrl = await muxStreams(item.videoUrl, item.audioUrl);
-        const downloadId = await save(blobUrl, item.suffix, "mp4");
+        const downloadId = await save(blobUrl, item.suffix, "mp4", sourceItem);
         blobDownloads.set(downloadId, blobUrl);
         const [download] = await api.downloads.search({ id: downloadId }).catch(() => []);
         if (download && download.state !== "in_progress" && blobDownloads.has(downloadId)) {
@@ -265,12 +312,14 @@ async function downloadJob(job) {
           [item.videoUrl, item.suffix],
           [item.audioUrl, `${item.suffix || ""}_audio`],
         ]) {
+          const stream = { kind: "direct", url, suffix, ext: "mp4" };
           try {
-            await save(url, suffix, "mp4");
+            await save(url, suffix, "mp4", stream);
             saved++;
             fallbackSaved++;
           } catch (fallbackError) {
             failed++;
+            await recordDownloadFailure(job, stream, fallbackError, recoveryId);
             console.warn("[Reddit Media Grab] separate stream failed", fallbackError);
           }
         }
@@ -278,17 +327,52 @@ async function downloadJob(job) {
       }
     } catch (error) {
       failed++;
+      await recordDownloadFailure(job, sourceItem, error, recoveryId);
       console.warn("[Reddit Media Grab] media item failed", error);
     }
   }
 
-  if (!saved) throw new Error(failed ? "Every media download failed" : "No downloadable media found");
+  if (!saved) throw new Error(failed ? "Every media download failed. Check Failed downloads in extension settings." : "No downloadable media found");
   return { ok: true, saved, failed, separateAudio };
 }
 
-api.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+api.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (["recovery-list", "recovery-retry", "recovery-dismiss"].includes(message?.type)) {
+    if (sender.id !== api.runtime.id || sender.url?.split(/[?#]/)[0] !== api.runtime.getURL("options.html")) {
+      sendResponse({ ok: false, error: "Open extension settings to manage failed downloads." });
+      return undefined;
+    }
+    (async () => {
+      if (message.type === "recovery-list") return { ok: true, items: await recovery.list() };
+      if (message.type === "recovery-retry") await recovery.retry(message.id);
+      else await recovery.dismiss(message.id);
+      return { ok: true };
+    })().then(sendResponse, error => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+  if (message?.type === "download-failed-post") {
+    if (sender.id !== api.runtime.id || !sender.tab?.id || !isRedditUrl(sender.url || sender.tab.url)) return undefined;
+    const job = { ...message.job, sourceTab: { id: sender.tab.id, incognito: sender.tab.incognito === true,
+      ...(sender.tab.cookieStoreId ? { cookieStoreId: sender.tab.cookieStoreId } : {}) } };
+    recovery.recordFailure(job, job.items?.[0], message.error, message.recoveryId)
+      .then(() => sendResponse({ ok: true }), error => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+  if (message?.type === "reddit-grab-request") {
+    try {
+      const origin = new URL(sender.url || sender.tab?.url).origin;
+      if (sender.id !== api.runtime.id || !sender.tab?.id || (sender.frameId || 0) !== 0 || origin !== message.request?.origin) {
+        throw new Error("Only this extension's Reddit tab can schedule requests");
+      }
+      const scope = `${sender.tab.incognito ? "private" : "normal"}:${sender.tab.cookieStoreId ||
+        (typeof browser !== "undefined" ? `tab-${sender.tab.id}` : "default")}`;
+      requestBroker.enqueue(message.request, { tabId: sender.tab.id, scope })
+        .then(value => sendResponse({ ok: true, value }), error => sendResponse({ ok: false, error: error.message }));
+    } catch (error) { sendResponse({ ok: false, error: error.message }); }
+    return true;
+  }
   if (message?.type !== "download-media") return undefined;
-  downloadJob(message.job)
+  downloadJob(message.job, message.recoveryId)
     .then(sendResponse)
     .catch((error) => sendResponse({ ok: false, error: error.message }));
   return true;
@@ -305,7 +389,7 @@ function isRedditUrl(value) {
 async function injectContentScript(tabId) {
   await api.scripting.executeScript({
     target: { tabId },
-    files: ["reddit-media.js", "content.js", "reddit-feeds.js", "custom-feeds.js"],
+    files: ["reddit-media.js", "reddit-requests.js", "content.js", "reddit-feeds.js", "custom-feeds.js"],
   });
 }
 
@@ -331,6 +415,8 @@ api.action.onClicked.addListener(async (tab) => {
 });
 
 recoverStaleOffscreen().catch(() => undefined);
+recovery.pending().then(ids => Promise.all(ids.map(id => reconcileTransfer(id).catch(() => undefined))))
+  .catch(() => undefined);
 api.tabs
   .query({ url: ["*://reddit.com/*", "*://*.reddit.com/*"] })
   .then((tabs) => Promise.all(tabs.filter((tab) => tab.id).map((tab) => injectContentScript(tab.id))))

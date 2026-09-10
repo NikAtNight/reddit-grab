@@ -583,24 +583,21 @@ test("adopts items that Reddit renders after the first pass", async () => {
   assert.equal(trigger.style.opacity, "0");
 });
 
-test("opens the dropdown once the post scrolls into view, without waiting for a hover", async () => {
-  const { root, post, overflow, trigger } = buildPost({ lazyMenu: true });
+test("scrolling and hovering a post do not load its lazy menu", async () => {
+  const { root, article, post, overflow, trigger } = buildPost({ lazyMenu: true });
 
   const { scrollIntoView } = await loadContentScript(root);
-  // No pointer ever touches this post.
   scrollIntoView();
-  await settle(300);
-
-  assert.deepEqual(
-    adoptedIds(actionRow(post)),
-    MENU_ITEMS.map((item) => item.id)
-  );
+  article.dispatch("pointerenter");
+  post.dispatch("pointerenter");
+  await settle(400);
+  assert.deepEqual(adoptedIds(actionRow(post)), []);
+  assert.equal(overflow.querySelector("faceplate-menu"), null);
   assert.equal(trigger.getAttribute("aria-expanded"), "false");
-  // The opacity clamp used while opening must not survive.
-  assert.equal(overflow.getAttribute("style"), null);
+  assert.equal(trigger.style.opacity, undefined);
 });
 
-test("primes every post in view, not just the one the pointer reached", async () => {
+test("dwelling on one action row primes only its menu", async () => {
   const first = buildPost({ lazyMenu: true });
   const second = buildPost({ lazyMenu: true });
   const root = new FakeElement("html");
@@ -609,29 +606,41 @@ test("primes every post in view, not just the one the pointer reached", async ()
 
   const { scrollIntoView } = await loadContentScript(root);
   scrollIntoView();
+  actionRow(first.post).dispatch("pointerenter");
   await settle(600);
 
-  for (const one of [first, second]) {
-    assert.deepEqual(
-      adoptedIds(actionRow(one.post)),
-      MENU_ITEMS.map((item) => item.id)
-    );
-    // Each dropdown is opened and closed again; none is left hanging open.
-    assert.equal(one.trigger.getAttribute("aria-expanded"), "false");
-  }
+  assert.deepEqual(adoptedIds(actionRow(first.post)), MENU_ITEMS.map((item) => item.id));
+  assert.deepEqual(adoptedIds(actionRow(second.post)), []);
+  assert.equal(first.trigger.getAttribute("aria-expanded"), "false");
+  assert.equal(first.overflow.getAttribute("style"), null);
 });
 
-test("hovering also primes, for posts already on screen", async () => {
-  const { root, article, post } = buildPost({ lazyMenu: true });
+test("leaving the action row cancels loading; keyboard focus can load it", async () => {
+  const { root, post, overflow } = buildPost({ lazyMenu: true });
 
   await loadContentScript(root);
-  article.dispatch("pointerenter");
-  await settle(300);
+  actionRow(post).dispatch("pointerenter");
+  actionRow(post).dispatch("pointerleave");
+  await settle(400);
+  assert.equal(overflow.querySelector("faceplate-menu"), null);
+  actionRow(post).dispatch("focusin");
+  await settle(500);
 
   assert.deepEqual(
     adoptedIds(actionRow(post)),
     MENU_ITEMS.map((item) => item.id)
   );
+});
+
+test("action-row interaction does not prime menus during a shared API cooldown", async () => {
+  const { root, post, overflow, trigger } = buildPost({ lazyMenu: true });
+  const { context } = await loadContentScript(root);
+  context.chrome.storage = { local: { get: async () => ({ redditGrabFeedCooldown: Date.now() + 120000 }) } };
+  actionRow(post).dispatch("pointerenter");
+  await settle(400);
+  assert.equal(overflow.querySelector("faceplate-menu"), null);
+  assert.equal(trigger.getAttribute("aria-expanded"), "false");
+  assert.equal(trigger.style.opacity, undefined);
 });
 
 test("injects one row per post even though article and shreddit-post both match", async () => {
@@ -699,7 +708,152 @@ test("the Save media icon downloads the post it was injected for", async () => {
   assert.equal(saveMedia.title, "2 saved");
 });
 
-test("media detection still avoids Reddit's post markup", async () => {
+async function downloadFixture(root, fetcher, state = {}) {
+  let listener;
+  const jobs = [];
+  const messages = [];
+  const loaded = await loadContentScript(root, {
+    fetch: fetcher,
+    location: { origin: "https://www.reddit.com", pathname: "/r/interesting/comments/abc123/tray-defense/" },
+    chrome: {
+      storage: { local: {
+        get: async (key) => ({ [key]: state[key] }),
+        set: async (values) => Object.assign(state, values),
+      } },
+      runtime: {
+        id: "extension",
+        onMessage: { addListener(value) { listener = value; } },
+        sendMessage: async message => {
+          messages.push(message);
+          if (message.type === "download-media") jobs.push(message.job);
+          return { ok: true, saved: message.job.items.length };
+        },
+      },
+    },
+  });
+  vm.runInNewContext(await readFile("reddit-media.js", "utf8"), loaded.context);
+  return {
+    jobs, state, messages, context: loaded.context,
+    download: () => new Promise(resolve => listener({ type: "download-current-post" }, {}, resolve)),
+    retry: (permalink, recoveryId) => new Promise(resolve => listener({ type: "retry-download-post", permalink, recoveryId }, { id: "extension" }, resolve)),
+  };
+}
+
+test("canonical rendered images download during API cooldown without requesting JSON", async () => {
+  for (const attribute of ["content-href", "content-url"]) {
+    const { root, post } = buildPost();
+    post.setAttribute(attribute, "https://i.redd.it/full-original.png");
+    post.setAttribute("subreddit-name", "interesting");
+    const { download, jobs } = await downloadFixture(root, async () => { throw new Error("Unexpected API request"); }, {
+      redditGrabFeedCooldown: Date.now() + 120000,
+    });
+    assert.equal((await download()).ok, true);
+    assert.equal(jobs[0].postId, "abc123");
+    assert.equal(jobs[0].subreddit, "interesting");
+    assert.equal(jobs[0].items[0].url, "https://i.redd.it/full-original.png");
+  }
+});
+
+test("failed post JSON is saved for explicit retry with the original post identity", async () => {
+  const { root } = buildPost();
+  const fixture = await downloadFixture(root, async () => new Response("Limited", { status: 429 }));
+  const result = await fixture.download();
+  assert.equal(result.ok, false);
+  assert.match(result.error, /Failed downloads/);
+  assert.equal(fixture.jobs.length, 0);
+  assert.equal(fixture.messages[0].type, "download-failed-post");
+  assert.equal(fixture.messages[0].job.items[0].kind, "post");
+  assert.match(fixture.messages[0].job.items[0].url, /comments\/abc123\//);
+});
+
+test("post recovery keeps the queued post target even from another page and uses the shared coordinator", async () => {
+  const { root } = buildPost();
+  const fixture = await downloadFixture(root, async () => { throw new Error("Must use request coordinator"); });
+  const requests = [];
+  fixture.context.RedditGrabRequests = { fetch: async url => {
+    requests.push(url);
+    return Response.json([{ data: { children: [{ data: { id: "def456", url: "https://i.redd.it/full.jpg" } }] } }]);
+  } };
+  const result = await fixture.retry("/r/pics/comments/def456/another/", "recovery-example");
+  assert.equal(result.ok, true);
+  assert.match(requests[0], /comments\/def456\/another\.json/);
+  assert.equal(fixture.jobs[0].postId, "def456");
+  assert.equal(fixture.messages[0].recoveryId, "recovery-example");
+});
+
+test("preview images, galleries, videos, and conflicting canonical links keep JSON extraction", async () => {
+  const cases = [
+    { attrs: { "content-href": "https://preview.redd.it/thumb.jpg?width=320" }, fixture: "gallery" },
+    { attrs: { "content-href": "https://www.reddit.com/gallery/abc123" }, fixture: "gallery" },
+    { attrs: { "content-href": "https://v.redd.it/abc123" }, fixture: "video" },
+    { attrs: { "content-href": "https://i.redd.it/first.jpg", "content-url": "https://www.reddit.com/gallery/abc123" }, fixture: "gallery" },
+    { attrs: {}, fixture: "gallery" },
+  ];
+  for (const { attrs, fixture } of cases) {
+    const { root, post } = buildPost();
+    for (const [name, value] of Object.entries(attrs)) post.setAttribute(name, value);
+    post.appendChild(element("img", { src: "https://i.redd.it/thumbnail.jpg" }));
+    const json = JSON.parse(await readFile(`test/fixtures/${fixture}.json`, "utf8"));
+    let requests = 0;
+    const { download, jobs } = await downloadFixture(root, async () => {
+      requests++;
+      return Response.json([{ data: { children: [{ data: json }] } }]);
+    });
+    assert.equal((await download()).ok, true);
+    assert.equal(requests, 1);
+    if (fixture === "gallery") assert.equal(jobs[0].items.length, 2);
+    else assert.equal(jobs[0].items[0].kind, "reddit-video");
+  }
+});
+
+test("a 429 saves Retry-After and blocks later JSON requests without retrying", async () => {
+  const { root } = buildPost();
+  let requests = 0;
+  const before = Date.now();
+  const { download, state } = await downloadFixture(root, async () => {
+    requests++;
+    return new Response("Limited", { status: 429, headers: { "Retry-After": "180" } });
+  });
+  assert.match((await download()).error, /rate limit/);
+  assert.ok(state.redditGrabFeedCooldown >= before + 180000);
+  assert.match((await download()).error, /rate limit/);
+  assert.equal(requests, 1);
+  const another = await downloadFixture(root, async () => { throw new Error("Unexpected request during persisted cooldown"); }, state);
+  assert.match((await another.download()).error, /rate limit/);
+});
+
+test("HTTP-date and Reddit reset headers set the shared cooldown", async () => {
+  const until = Math.ceil((Date.now() + 240000) / 1000) * 1000;
+  for (const headers of [{ "Retry-After": new Date(until).toUTCString() }, { "x-ratelimit-reset": "240" }]) {
+    const { root } = buildPost();
+    const { download, state } = await downloadFixture(root, async () => new Response("Limited", { status: 429, headers }));
+    assert.match((await download()).error, /rate limit/);
+    assert.ok(state.redditGrabFeedCooldown >= until - 1000);
+  }
+});
+
+test("concurrent and later downloads reuse parsed JSON while each requested download still runs", async () => {
+  const { root } = buildPost();
+  let requests = 0;
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  const { download, jobs, state } = await downloadFixture(root, async () => {
+    requests++;
+    await pending;
+    return Response.json([{ data: { children: [{ data: { id: "abc123", url: "https://i.redd.it/full.jpg" } }] } }]);
+  });
+  const first = download();
+  const second = download();
+  release();
+  assert.equal((await first).ok, true);
+  assert.equal((await second).ok, true);
+  state.redditGrabFeedCooldown = Date.now() + 120000;
+  assert.equal((await download()).ok, true);
+  assert.equal(requests, 1);
+  assert.equal(jobs.length, 3);
+});
+
+test("post identity uses stable attributes and canonical media URLs", async () => {
   const source = await readFile("content.js", "utf8");
   assert.match(source, /shreddit-post/);
   assert.match(source, /post-id/);

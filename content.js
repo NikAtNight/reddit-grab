@@ -301,30 +301,33 @@
   // priming several posts at once makes them fight. One at a time.
   let primeQueue = Promise.resolve();
 
-  // Primed when the post scrolls into view rather than on hover: waiting for
-  // the pointer leaves most of the feed showing nothing but "Save media", and
-  // priming the whole feed up front opens far too many dropdowns at once.
-  function primeOnce(post, row, host, before) {
-    let observer = null;
+  // Opening lazy menus can request Reddit data. Only deliberate interaction
+  // with our action row should load them, not scrolling or hovering a post.
+  function primeOnce(row, host, before) {
     let started = false;
-
-    const start = () => {
-      if (started) return;
-      started = true;
-      observer?.disconnect();
-      post.removeEventListener("pointerenter", start);
-      primeQueue = primeQueue.then(() => primeMenu(row, host, before)).catch(() => {});
+    let interested = false;
+    let queued = false;
+    let dwell;
+    const schedule = () => {
+      interested = true;
+      clearTimeout(dwell);
+      if (started || queued) return;
+      dwell = setTimeout(() => {
+        queued = true;
+        primeQueue = primeQueue.then(async () => {
+          queued = false;
+          if (!interested || !row.parentNode || await apiCooldownActive()) return;
+          if (!interested || !row.parentNode) return;
+          started = true;
+          await primeMenu(row, host, before);
+        }).catch(() => {});
+      }, 300);
     };
-
-    if (typeof IntersectionObserver === "function") {
-      observer = new IntersectionObserver((entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) start();
-      });
-      observer.observe(post);
-    }
-    // Hover still counts, in case the post is already on screen and the
-    // intersection callback has not run yet.
-    post.addEventListener("pointerenter", start);
+    const cancel = () => { interested = false; clearTimeout(dwell); };
+    row.addEventListener("pointerenter", schedule);
+    row.addEventListener("focusin", schedule);
+    row.addEventListener("pointerleave", cancel);
+    row.addEventListener("focusout", cancel);
   }
 
   // --- Save media ----------------------------------------------------------
@@ -393,9 +396,7 @@
       button.style.color = "#d93900";
 
       try {
-        const result = await downloadPost(permalink, (status) => {
-          button.title = status;
-        });
+        const result = await downloadPost(permalink);
         button.title = result.failed
           ? `${result.saved} saved, ${result.failed} failed`
           : result.separateAudio
@@ -517,7 +518,7 @@
 
     if (point.host) {
       watchMenu(row, point.host, saveMedia);
-      primeOnce(post, row, point.host, saveMedia);
+      primeOnce(row, point.host, saveMedia);
     }
   }
 
@@ -548,47 +549,104 @@
     return globalThis.RedditGrabMedia;
   }
 
-  async function fetchWithRetry(url, onStatus, attempts = 3) {
-    for (let attempt = 0; attempt < attempts; attempt++) {
-      const response = await fetch(url, { credentials: "same-origin" });
-      if (response.status !== 429) return response;
-      if (attempt === attempts - 1) throw new Error("Reddit rate limit reached — try again shortly");
-      const delay = Math.min(Number(response.headers.get("retry-after")) || 4 * 2 ** attempt, 30);
-      for (let remaining = delay; remaining > 0; remaining--) {
-        onStatus?.(`Retrying in ${remaining}s…`);
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+  const postJobs = new Map();
+  const cooldownKey = "redditGrabFeedCooldown";
+  let blockedUntil = 0;
+
+  function renderedImageJob(permalink, media) {
+    const postId = permalink.match(/\/comments\/([a-z0-9]+)/i)?.[1];
+    if (!postId) return null;
+    for (const element of document.querySelectorAll("shreddit-post")) {
+      if (permalinkFrom(element)?.match(/\/comments\/([a-z0-9]+)/i)?.[1] !== postId) continue;
+      const links = [element.getAttribute("content-href"), element.getAttribute("content-url")].filter(Boolean);
+      if (!links.length) continue;
+      const urls = [];
+      for (const link of links) {
+        try {
+          const url = new URL(link);
+          if (url.protocol !== "https:" || url.username || url.password ||
+              !/\.(?:jpe?g|png|gif|webp|avif)$/i.test(url.pathname) ||
+              /(^|\.)(?:preview\.redd\.it|external-preview\.redd\.it|redditmedia\.com|redditstatic\.com)$/i.test(url.hostname)) return null;
+          urls.push(url.href);
+        } catch { return null; }
       }
+      // Conflicting canonical links may describe a gallery or video preview.
+      if (new Set(urls).size !== 1) return null;
+      return media.extractMedia({
+        id: postId,
+        subreddit: element.getAttribute("subreddit-name") || permalink.match(/\/r\/([^/]+)/i)?.[1],
+        url: urls[0],
+      });
     }
-    throw new Error("Unable to load the Reddit post");
+    return null;
   }
 
-  async function downloadPost(permalink, onStatus) {
-    const media = mediaModule();
-    const response = await fetchWithRetry(
-      media.redditJsonUrl(permalink, location.origin),
-      onStatus
-    );
+  async function apiCooldownActive() {
+    try {
+      const stored = await api.storage?.local?.get(cooldownKey);
+      blockedUntil = Math.max(blockedUntil, Number(stored?.[cooldownKey]) || 0);
+    } catch { /* The in-memory cooldown still applies if storage is unavailable. */ }
+    return Date.now() < blockedUntil;
+  }
+
+  async function fetchPostJson(url) {
+    if (await apiCooldownActive()) throw new Error("Reddit rate limit reached. Try again later.");
+    const response = await (globalThis.RedditGrabRequests?.fetch || fetch)(url, { credentials: "same-origin" });
+    if (response.status === 429) {
+      const retry = response.headers.get("retry-after");
+      const seconds = Number(retry || response.headers.get("x-ratelimit-reset"));
+      const until = retry && !Number.isFinite(Number(retry)) ? Date.parse(retry) : Date.now() + seconds * 1000;
+      blockedUntil = Math.max(blockedUntil, Date.now() + 60000, Number.isFinite(until) ? until : 0);
+      try { await api.storage?.local?.set({ [cooldownKey]: blockedUntil }); } catch { /* Keep the cooldown in this tab. */ }
+      throw new Error("Reddit rate limit reached. Try again later.");
+    }
     if (!response.ok) throw new Error(`Reddit returned ${response.status}`);
-    const listing = await response.json();
-    const post = listing?.[0]?.data?.children?.[0]?.data;
-    if (!post) throw new Error("Reddit returned an unexpected response");
+    return response.json();
+  }
 
-    const job = media.extractMedia(post);
-    if (!job.items.length) throw new Error("This post has no downloadable media");
+  async function downloadPost(permalink, recoveryId) {
+    const media = mediaModule();
+    let job = renderedImageJob(permalink, media);
+    if (!job) {
+      const url = media.redditJsonUrl(permalink, location.origin);
+      if (!postJobs.has(url)) {
+        const pending = fetchPostJson(url).then((listing) => {
+          const post = listing?.[0]?.data?.children?.[0]?.data;
+          if (!post) throw new Error("Reddit returned an unexpected response");
+          const parsed = media.extractMedia(post);
+          if (!parsed.items.length) throw new Error("This post has no downloadable media");
+          return parsed;
+        }).catch((error) => {
+          if (postJobs.get(url) === pending) postJobs.delete(url);
+          throw error;
+        });
+        postJobs.set(url, pending);
+        if (postJobs.size > 100) postJobs.delete(postJobs.keys().next().value);
+      }
+      try { job = await postJobs.get(url); }
+      catch (error) {
+        const result = await api.runtime.sendMessage({ type: "download-failed-post", recoveryId, error: error.message,
+          job: { postId: permalink.match(/\/comments\/([a-z0-9]+)/i)?.[1], subreddit: permalink.match(/\/r\/([^/]+)/i)?.[1],
+            items: [{ kind: "post", url: new URL(permalink, location.origin).href }] } }).catch(() => null);
+        if (result?.ok) error.message += " Saved in Failed downloads in extension settings.";
+        throw error;
+      }
+    }
 
-    const result = await api.runtime.sendMessage({ type: "download-media", job });
+    const result = await api.runtime.sendMessage({ type: "download-media", job, recoveryId });
     if (!result?.ok) throw new Error(result?.error || "Download failed");
     return result;
   }
 
-  api.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (message?.type !== "download-current-post") return undefined;
-    const permalink = normalizePermalink(location.pathname);
+  api.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (!["download-current-post", "retry-download-post"].includes(message?.type)) return undefined;
+    if (message.type === "retry-download-post" && sender.id !== api.runtime.id) return undefined;
+    const permalink = normalizePermalink(message.type === "retry-download-post" ? message.permalink : location.pathname);
     if (!permalink) {
       sendResponse({ ok: false, error: "Open a Reddit post first" });
       return undefined;
     }
-    downloadPost(permalink)
+    downloadPost(permalink, message.recoveryId)
       .then((result) => sendResponse(result))
       .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;

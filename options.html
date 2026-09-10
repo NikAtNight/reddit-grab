@@ -36,6 +36,13 @@
         cursor: pointer;
       }
       #status { margin-left: 9px; color: #16833b; font-size: 12px; }
+      h2 { font-size: 16px; margin: 24px 0 8px; }
+      #recovery-list { padding: 0; list-style: none; }
+      #recovery-list li { border-top: 1px solid #8885; padding: 12px 0; }
+      #recovery-list p { margin: 4px 0 8px; overflow-wrap: anywhere; }
+      #recovery-list button { margin-right: 8px; }
+      button:disabled { opacity: .55; cursor: default; }
+      .secondary { background: #666; }
     </style>
   </head>
   <body>
@@ -54,6 +61,13 @@
       </div>
       <button type="submit">Save settings</button><span id="status" aria-live="polite"></span>
     </form>
+    <section aria-labelledby="recovery-heading">
+      <h2 id="recovery-heading">Failed downloads</h2>
+      <p class="hint">The 100 most recent failures are kept here. Retry downloads only the failed item. Nothing retries automatically.</p>
+      <button id="recovery-refresh" type="button" class="secondary">Refresh list</button>
+      <p id="recovery-status" role="status" aria-live="polite"></p>
+      <ul id="recovery-list"></ul>
+    </section>
     <script src="options.js"></script>
   </body>
 </html>

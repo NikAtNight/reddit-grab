@@ -11,6 +11,32 @@
   redditButtonStyle.textContent = "button { display: inline-block; }";
   document.head.append(redditButtonStyle);
   // All API responses are fixtures. No request is sent to Reddit.
+  // Existing live-response scenarios explicitly refresh; cache checks below
+  // switch back to the production behavior without forcing a refresh.
+  let forceLiveReads = true;
+  let storageEnabled = false;
+  const storageValues = {};
+  const storageListeners = [];
+  const fixtureStorage = {
+    async get(keys) {
+      if (!storageEnabled) return {};
+      if (keys === null) return structuredClone(storageValues);
+      return Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map(key => [key, structuredClone(storageValues[key])]));
+    },
+    async set(values) {
+      const changes = Object.fromEntries(Object.entries(values).map(([key, value]) =>
+        [key, { oldValue: storageValues[key], newValue: structuredClone(value) }]));
+      Object.assign(storageValues, structuredClone(values));
+      if (storageEnabled) for (const listener of storageListeners) listener(changes, "local");
+    },
+  };
+  window.browser = { storage: { local: fixtureStorage, onChanged: { addListener: listener => storageListeners.push(listener) } } };
+  const originalClient = RedditGrabFeeds.createClient;
+  RedditGrabFeeds.createClient = (...args) => {
+    const client = originalClient(...args);
+    return { ...client, open: (target, options = {}) => client.open(target,
+      { ...options, refresh: forceLiveReads || options.refresh, cachedOnly: forceLiveReads ? false : options.cachedOnly }) };
+  };
   const originalTarget = RedditGrabFeeds.targetFromUrl;
   RedditGrabFeeds.targetFromUrl = (value) => originalTarget(
     "https://www.reddit.com" + (new URL(value).searchParams.get("route") || "/user/example-user/")
@@ -25,17 +51,22 @@
   ];
   let writes = 0;
   let listingReads = 0;
-  let holdRead = false;
-  let releaseRead;
+  let allRequests = 0;
+  let holdAccount = false;
+  let releaseAccount;
   let holdWrite = false;
   let releaseWrite;
-  let failLookup = false;
+  let failLookup = 0;
   let holdListing = false;
   let releaseListing;
   let staleListing = null;
   window.fetch = async (path, options) => {
-    if (failLookup) { failLookup = false; return new Response("Unavailable", { status: 500 }); }
-    if (path === "/api/me.json") return Response.json({ data: { name: "tester", modhash: "fixture-only" } });
+    allRequests++;
+    if (failLookup) { const status = failLookup; failLookup = 0; return new Response("Unavailable", { status }); }
+    if (path === "/api/me.json") {
+      if (holdAccount) { holdAccount = false; await new Promise(resolve => { releaseAccount = resolve; }); }
+      return Response.json({ data: { name: "tester", modhash: "fixture-only" } });
+    }
     if (path.startsWith("/api/info.json")) {
       const name = new URL(path, location.origin).searchParams.get("sr_name");
       return Response.json({ data: { children: [{ data: { name: "t5_fixture", display_name: name } }] } });
@@ -54,7 +85,6 @@
       feed.subreddits.push(JSON.parse(options.body.get("model")));
       return Response.json({});
     }
-    if (holdRead) { holdRead = false; await new Promise(resolve => { releaseRead = resolve; }); }
     return Response.json({ data: feed });
   };
 </script>
@@ -137,6 +167,9 @@
       navigate("/user/example-user/");
       check(get("launcher").textContent.includes("Checking"), "navigation clears the previous membership indicator");
       await open();
+      check(get("cache-status").textContent.includes("Saved feeds for u/tester") &&
+        get("cache-status").textContent.includes("Last full sync:") && !get("cache-status").textContent.includes("unknown"),
+        "picker identifies the saved account and successful full sync time");
       check(root.activeElement === get("search"), "search receives keyboard focus");
       check([...root.querySelectorAll(".feed")].find(b => b.textContent.includes("Full feed")).disabled, "full feed disabled");
       get("search").value = "nonexistent";
@@ -148,6 +181,7 @@
       await wait(() => get("status").textContent.includes("was added"));
       check(writes === 1 && row().disabled, "repeated clicks produce one verified add");
       check(get("launcher").textContent.includes("In 1 feed"), "verified add immediately updates the launcher");
+      check(get("cache-status").textContent.includes("Local update:"), "verified addition shows its local update time separately from full sync");
       get("search").dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
       check(get("panel").hidden && root.activeElement === get("launcher"), "Escape dismisses picker and restores focus");
       staleListing = feeds.map(data => ({ data: { ...data,
@@ -159,11 +193,11 @@
       navigate("/r/example/");
       check(get("panel").hidden && get("launcher").getAttribute("aria-label").includes("r/example"), "SPA navigation resets target and closes picker");
       await open();
-      holdRead = true;
+      holdAccount = true;
       row().click();
-      await wait(() => releaseRead);
+      await wait(() => releaseAccount);
       navigate("/user/next-profile/");
-      releaseRead();
+      releaseAccount();
       await open();
       await wait(() => !row().disabled);
       check(writes === 1, "navigation before write prevents adding a stale target");
@@ -221,11 +255,11 @@
       check(addedJoin.nextElementSibling.hidden, "verified picker addition immediately hides matching post Add to feed");
       get("close").click();
       await wait(() => join.style.display === "none");
-      failLookup = true;
+      failLookup = 401;
       navigate("/r/unavailable/");
       await wait(() => get("launcher").textContent.includes("Check feed status"));
-      check(get("launcher").title.includes("HTTP 500"), "failed lookup shows unknown status rather than claiming no membership");
-      check(!join.nextElementSibling.hidden, "failed lookup offers Add to feed instead of trusting old membership");
+      check(get("launcher").title.includes("Sign in"), "authentication failure shows unknown status rather than claiming no membership");
+      check(!join.nextElementSibling.hidden, "authentication failure offers Add to feed instead of trusting old-account membership");
       navigate("/r/example/comments/abc/post");
       check(host.hidden, "post pages hide launcher");
       navigate("/");
@@ -265,12 +299,12 @@
       await wait(() => !postButton.hidden);
       postButton.click();
       await wait(() => row() && !get("search").disabled);
-      holdRead = true; releaseRead = null;
+      holdAccount = true; releaseAccount = null;
       row().click();
-      await wait(() => releaseRead);
+      await wait(() => releaseAccount);
       unknown.setAttribute("subreddit-name", "third_inline");
       postButton.click();
-      releaseRead();
+      releaseAccount();
       await wait(() => get("target").textContent === "r/third_inline" && row() && !row().disabled);
       check(writes === beforeInline + 1, "switching post targets cancels a pending pre-write add");
       get("close").click();
@@ -334,6 +368,114 @@
       clone.click();
       await wait(() => !get("panel").hidden && !get("search").disabled);
       check(get("target").textContent === "r/redrawn_post" && unknown.querySelectorAll("[data-reddit-grab-post-feed]").length === 1, "redrawn button opens picker for live community without its original listener or duplicates");
+      get("close").click();
+      const profilePost = document.createElement("shreddit-post");
+      profilePost.setAttribute("subreddit-name", "u_example-user");
+      const profileJoin = document.createElement("shreddit-join-button");
+      profilePost.append(profileJoin);
+      document.body.append(profilePost);
+      await wait(() => profileJoin.nextElementSibling?.hidden);
+      check(getComputedStyle(profileJoin).display === "none" && getComputedStyle(profileJoin.nextElementSibling).display === "none",
+        "profile feed member with hyphenated username has no rendered Join or Add button");
+      profilePost.removeAttribute("subreddit-name");
+      profilePost.setAttribute("subreddit-prefixed-name", "u/EXAMPLE-USER");
+      await wait(() => profileJoin.nextElementSibling?.hidden);
+      check(profileJoin.nextElementSibling.dataset.community === "u_example-user", "prefixed profile names normalize to feed membership names");
+      profilePost.setAttribute("subreddit-prefixed-name", "u/abcdefghijklmnopqrst");
+      await wait(() => profileJoin.nextElementSibling?.dataset.community === "u_abcdefghijklmnopqrst");
+      profileJoin.nextElementSibling.click();
+      await wait(() => !get("panel").hidden && !get("search").disabled);
+      check(get("target").textContent === "u/abcdefghijklmnopqrst", "maximum-length profile username opens the picker as a profile");
+      row().click();
+      await wait(() => get("status").textContent.includes("was added"));
+      check(feeds[0].subreddits.some(member => member.name === "u_abcdefghijklmnopqrst") &&
+        getComputedStyle(profileJoin.nextElementSibling).display === "none", "profile add uses internal user community name and removes the button");
+      get("close").click();
+      profileJoin.remove();
+      const follow = document.createElement("follow-button");
+      const followRoot = follow.attachShadow({ mode: "open" });
+      const nativeFollow = document.createElement("button");
+      nativeFollow.dataset.testid = "follow-button";
+      nativeFollow.textContent = "Follow";
+      followRoot.append(nativeFollow);
+      profilePost.append(follow);
+      await wait(() => follow.nextElementSibling?.hidden);
+      check(getComputedStyle(follow).display === "none" && getComputedStyle(follow.nextElementSibling).display === "none",
+        "native profile Follow control disappears for existing custom-feed members");
+      profilePost.setAttribute("subreddit-prefixed-name", "u/new_profile");
+      await wait(() => follow.nextElementSibling?.dataset.community === "u_new_profile" && !follow.nextElementSibling.hidden);
+      follow.nextElementSibling.click();
+      await wait(() => !get("panel").hidden && !get("search").disabled);
+      check(get("target").textContent === "u/new_profile", "native Follow replacement opens the profile feed picker");
+      row().click();
+      await wait(() => get("status").textContent.includes("was added"));
+      check(getComputedStyle(follow.nextElementSibling).display === "none", "verified profile addition removes Follow replacement");
+      get("close").click();
+      const outsideFollow = document.createElement("follow-button");
+      document.body.append(outsideFollow);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      check(!outsideFollow.style.display, "profile header Follow controls outside posts stay unchanged");
+      forceLiveReads = false;
+      storageEnabled = true;
+      const cachedReads = listingReads;
+      const cachedRequests = allRequests;
+      navigate("/user/example-user/");
+      await wait(() => get("launcher").textContent.includes("In 1 feed"));
+      await open();
+      check(listingReads === cachedReads && allRequests === cachedRequests, "cached navigation and picker opening make no requests");
+      get("close").click();
+      window.dispatchEvent(new Event("focus"));
+      get("launcher").dispatchEvent(new Event("pointerenter"));
+      await new Promise(resolve => setTimeout(resolve, 500));
+      check(listingReads === cachedReads && allRequests === cachedRequests, "focus and hover make no requests");
+      await open();
+      get("retry").click();
+      await wait(() => listingReads > cachedReads && !get("search").disabled);
+      check(listingReads === cachedReads + 1, "Reload feeds explicitly refreshes Reddit membership");
+      get("close").click();
+      const saved = storageValues.redditGrabFeedCache;
+      await fixtureStorage.set({ redditGrabFeedCache: { ...saved, savedAt: Date.now() - 2 * 24 * 60 * 60 * 1000 } });
+      const beforeStatusChecks = allRequests;
+      navigate("/user/cache-status-check/");
+      await open();
+      check(allRequests === beforeStatusChecks && !row().disabled && get("cache-status").textContent.includes("Reload feeds to include changes"),
+        "old snapshots remain usable with explicit sync status and no automatic listing request");
+      await fixtureStorage.set({ redditGrabFeedCooldown: Date.now() + 120000 });
+      check(get("request-status").textContent.includes("Reddit requests paused for") && get("retry").disabled && row().disabled,
+        "shared cooldown is visible and blocks network actions while keeping saved feeds visible");
+      get("retry").click(); row().click();
+      check(allRequests === beforeStatusChecks, "disabled cooldown actions make no requests");
+      await fixtureStorage.set({ redditGrabFeedCooldown: Date.now() + 30 });
+      await wait(() => !get("retry").disabled);
+      check(!row().disabled && allRequests === beforeStatusChecks, "cooldown expires locally without an API request");
+      await fixtureStorage.set({ redditGrabRequestStatus: { queued: 2, inFlight: 1, lastRequestAt: Date.now() } });
+      check(get("request-status").textContent.includes("1 running, 2 waiting"), "shared request activity appears without polling the API");
+      await fixtureStorage.set({ redditGrabRequestStatus: { queued: 0, inFlight: 0, lastRequestAt: Date.now() } });
+      Object.defineProperty(navigator, "onLine", { configurable: true, value: false });
+      window.dispatchEvent(new Event("offline"));
+      check(get("request-status").textContent.includes("Offline. Showing saved feeds.") && get("retry").disabled && row().disabled,
+        "offline state keeps saved membership visible and disables network actions");
+      get("close").click();
+      await open();
+      check(allRequests === beforeStatusChecks && get("cache-status").textContent.includes("u/tester"), "offline picker reopening uses saved data without requests");
+      Object.defineProperty(navigator, "onLine", { configurable: true, value: true });
+      window.dispatchEvent(new Event("online"));
+      check(!row().disabled && !get("retry").disabled && get("request-status").hidden, "reconnecting restores actions without refreshing feeds");
+      const currentSaved = storageValues.redditGrabFeedCache;
+      const profileFeed = currentSaved.feeds.find(feed => feed.label === "Profiles");
+      const updatedAt = Date.now();
+      await fixtureStorage.set({ [`redditGrabFeed:tester:${profileFeed.path}`]: {
+        savedAt: updatedAt, feed: { ...profileFeed, names: [...profileFeed.names, "u_cache-status-check"] },
+      } });
+      await wait(() => row().disabled && get("launcher").textContent.includes("In 1 feed"));
+      check(row().textContent.includes("Added") && row().querySelector(".meta").textContent.includes(`${profileFeed.names.length + 1}/100`) &&
+        get("cache-status").textContent.includes("Local update:") && allRequests === beforeStatusChecks,
+        "another tab's verified update refreshes membership, count, and timestamp without Reddit requests");
+      failLookup = 500;
+      get("retry").click();
+      await wait(() => !get("search").disabled && get("status").textContent.includes("HTTP 500"));
+      check(get("status").textContent.includes("Using saved feeds") && row().textContent.includes("Added") &&
+        get("cache-status").textContent.includes("Saved feeds for u/tester"), "failed explicit sync keeps saved membership visible with an error warning");
       get("close").click();
       window.browserCheckResult = { passed: results.length, failed: 0, checks: results };
     } catch (error) {

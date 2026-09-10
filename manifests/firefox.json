@@ -34,6 +34,8 @@
   "background": {
     "scripts": [
       "reddit-media.js",
+      "reddit-requests.js",
+      "download-recovery.js",
       "background.js"
     ]
   },
@@ -45,6 +47,7 @@
       ],
       "js": [
         "reddit-media.js",
+        "reddit-requests.js",
         "content.js",
         "reddit-feeds.js",
         "custom-feeds.js"

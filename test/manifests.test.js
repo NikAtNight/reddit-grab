@@ -27,7 +27,7 @@ test("browser manifests share identity, hosts, and content scripts", async () =>
     "*://reddit.com/*",
     "*://*.reddit.com/*",
   ]);
-  assert.deepEqual(chrome.content_scripts[0].js, ["reddit-media.js", "content.js", "reddit-feeds.js", "custom-feeds.js"]);
+  assert.deepEqual(chrome.content_scripts[0].js, ["reddit-media.js", "reddit-requests.js", "content.js", "reddit-feeds.js", "custom-feeds.js"]);
   assert.ok(chrome.host_permissions.includes("*://v.redd.it/*"));
 });
 
@@ -45,7 +45,7 @@ test("Chrome uses a service worker and offscreen permission only", async () => {
 test("Firefox uses background scripts and declares current privacy metadata", async () => {
   const firefox = await readJson("manifests/firefox.json");
 
-  assert.deepEqual(firefox.background, { scripts: ["reddit-media.js", "background.js"] });
+  assert.deepEqual(firefox.background, { scripts: ["reddit-media.js", "reddit-requests.js", "download-recovery.js", "background.js"] });
   assert.ok(!firefox.permissions.includes("offscreen"));
   assert.ok(firefox.permissions.includes("activeTab"));
   assert.ok(firefox.permissions.includes("scripting"));
@@ -67,6 +67,8 @@ test("build emits isolated browser packages from the strict allowlist", async ()
     "content.js",
     "custom-feeds.js",
     "reddit-feeds.js",
+    "reddit-requests.js",
+    "download-recovery.js",
     "icons",
     "manifest.json",
     "mux-lib.js",

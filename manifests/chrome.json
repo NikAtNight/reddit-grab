@@ -30,6 +30,7 @@
       ],
       "js": [
         "reddit-media.js",
+        "reddit-requests.js",
         "content.js",
         "reddit-feeds.js",
         "custom-feeds.js"

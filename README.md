@@ -46,8 +46,8 @@ Every post gains a row of icons in its action bar, just after **Share**:
 
 - One icon per item from that post's overflow menu — normally Follow post,
   Award, Save, Hide, and Report.
-- A **Save media** icon, last in the row, that loads the post's JSON and
-  downloads all available media.
+- A **Save media** icon, last in the row, that downloads available media.
+  Direct images use the post's canonical image URL when available.
 
 Those are not copies. The extension **moves** Reddit's own `<li>` nodes out of
 the menu and into the action bar, then hides everything inside them except the
@@ -76,26 +76,33 @@ corner. Search your existing custom feeds, then click the feed you want to add
 the current profile or community to. This also works on profile tabs such as
 Submitted and Comments, and community listings such as New and Top.
 
-The floating button checks membership automatically. If the current profile or
-community is already included, it turns green and shows **In 1 feed** or
-**In 2 feeds**, with the feed names on hover. Open the picker to see the matching
-feeds. While checking, or if Reddit cannot be reached, it shows an explicit
-checking or unknown state. Opening the picker, returning to the tab, hovering
-over the button, or switching profile tabs refreshes the membership check.
-Feeds changed through the picker are read individually again so an older
-aggregate feed listing cannot erase a verified addition from the indicator.
+The floating button checks saved membership. If the current profile or community
+is included, it turns green and shows **In 1 feed** or **In 2 feeds**, with the
+feed names on hover. Open the picker to see the matching feeds. Its status line
+shows the saved account, last full sync, and last local update.
 
 Post **Join** controls become **Add to feed** buttons. Click one to open the same
-picker for that post's community without leaving the page. This works while
-scrolling profiles, communities, and other post listings. After a verified add,
-matching post buttons disappear. Communities already in your feeds have no
-button. Reddit's **Joined** controls stay unchanged.
+picker for that post's community without leaving the page. After a verified add,
+matching post buttons disappear. Communities and profiles already in your feeds
+have no button. Reddit's **Joined** and **Following** controls stay unchanged.
 
-Membership loads automatically on custom-feed pages too, even though those pages
-have no floating page button. Returning to the tab or changing the feed sort
-refreshes it. Scrolling reuses that list without requests for individual posts. If a lookup fails, Add to feed remains available and the
-picker checks membership again before adding. The floating button continues to
-show membership for the profile or community page you are viewing.
+Saved feed lists do not expire automatically. Scrolling, changing pages, returning
+to a tab, and hovering make no feed API requests. The first explicit picker open
+checks the account and loads feeds if none are saved. Later opens in the same tab
+reuse the saved list. A new tab checks the account once when you open its picker.
+
+Use **Reload feeds** after changing feeds elsewhere or switching accounts. Until
+then, indicators reflect the named account's saved list. Each feed's saved member
+names supply its count and capacity check. A confirmed add updates that feed and
+other open tabs immediately. There is no separate count request or whole-list
+reload after an add. Adds still check the live account and verify the destination
+membership with one readback. Uncertain writes are checked before another attempt.
+No passwords or Reddit session tokens are saved. Migration JSON files stay separate.
+
+The picker shows queued requests and a cooldown countdown. During a cooldown or
+while offline, saved membership remains available and network actions are disabled.
+A failed sync can show saved data with a warning. Authentication failures require
+signing in again. Use the extension's settings to retry failed downloads explicitly.
 
 The picker shows each feed's privacy, member count, and whether the current
 profile or community is already included. Full feeds and existing memberships
@@ -182,13 +189,10 @@ degrades in steps rather than breaking:
   rule holds however the item is structured.
 - `faceplate-tracker` wrappers are moved along with the item they wrap, so
   Reddit's own analytics stay attached.
-- The menu does not exist until its dropdown is first opened — Reddit fetches
-  it through `shreddit-async-loader`. Each post is therefore primed when it
-  scrolls into view: the dropdown is opened behind an `opacity: 0` clamp, the
-  items are taken, and it is closed again. Priming is queued one post at a
-  time, because Reddit closes whichever dropdown is already open when another
-  opens. A `MutationObserver` also adopts items whenever they appear on their
-  own, and hovering a post primes it immediately.
+- Reddit loads overflow menus on demand. Scrolling and hovering the whole post
+  no longer open them. Hover or focus the action row briefly to load its icons.
+  The native overflow remains available until extraction. Menu loading pauses
+  while the extension's shared Reddit API cooldown is active.
 - The injection point, not the post element, is what gets claimed. Reddit nests
   `article` and `shreddit-post`, so a post matches the post selector more than
   once and would otherwise get one row per wrapper.
@@ -197,9 +201,53 @@ degrades in steps rather than breaking:
 The **Save media** icon is the extension's own, built with `createElementNS`
 rather than `innerHTML` so it still renders if Reddit enforces Trusted Types.
 
-Media detection is based solely on the post JSON. DASH requests run
-in the background extension context where the required host permissions are
-declared; Reddit page telemetry and CORS errors do not affect them.
+Direct image downloads use the matching rendered post's canonical image URL
+when it unambiguously identifies an image. Other media uses post JSON, cached
+for up to 100 posts per tab with concurrent requests shared. A 429 stops requests
+without retries and records Reddit's cooldown headers. Images with known direct
+URLs and previously cached post jobs can still download during that API cooldown.
+Galleries or videos needing uncached JSON must wait; thumbnails are not used as
+substitutes for complete galleries. Media hosts can impose their own limits.
+
+Feed requests and post-JSON downloads share one queue across extension tabs. It
+runs one request at a time, spaces starts by at least 1.5 seconds, and combines
+concurrent matching reads within the same browser session. Requests still execute
+in their originating Reddit tab. A 429 or exhausted quota header pauses queued
+requests using Reddit's cooldown headers. Requests do not retry automatically.
+
+Typical Reddit API request counts:
+
+| Action | Requests |
+| --- | --- |
+| Browse, scroll, hover the feed picker, or update a cached count | 0 |
+| First picker load with no saved feeds | 2: account and feed list |
+| Open saved feeds in a new tab | 1: account check |
+| Reopen saved feeds in that tab | 0 |
+| Add to a known feed | 3: account check, member PUT, verification GET |
+| Reload feeds | 2, plus a read for each changed or uncertain feed needing reconciliation |
+| Download a canonical image or cached post job | 0 Reddit API requests |
+| Download an uncached gallery or other post needing JSON | 1 |
+
+Loading Reddit's native overflow menu after action-row hover can still cause
+Reddit-owned requests outside this queue. The extension pauses menu loading during
+a known cooldown. Reddit's own page activity, other extensions, and other devices
+also remain outside this queue, so pacing cannot guarantee that 429s never occur.
+DASH manifests, audio probes, and media transfers use their media
+hosts separately. They do not wait behind the Reddit JSON queue.
+
+### Retry failed downloads
+
+Open extension settings and use **Failed downloads**. The latest 100 failures are
+saved locally with **Retry** and **Dismiss** controls. Retry downloads only the
+failed item, so it does not repeat successful gallery files or video fallback
+streams. Browser transfers stay tracked until completion; interrupted transfers
+return to the list. Nothing retries automatically when a cooldown ends.
+
+If post JSON failed before media extraction, retry needs a Reddit tab in the
+original browser container. Recovery keeps media source URLs, including required
+signed query strings, in local extension storage. It does not keep request headers,
+cookies, or Reddit modhashes. The list displays post identifiers and errors without
+exposing the raw URLs. Expired media links may require opening the post again.
 
 ## Development
 

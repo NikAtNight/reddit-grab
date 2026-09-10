@@ -11,6 +11,8 @@ const sharedFiles = [
   "background.js",
   "content.js",
   "reddit-feeds.js",
+  "reddit-requests.js",
+  "download-recovery.js",
   "custom-feeds.js",
   "reddit-media.js",
   "mux-lib.js",
