@@ -3,12 +3,7 @@
   "name": "Reddit Media Grab",
   "version": "2.0.0",
   "description": "Download Reddit images, galleries, GIFs, and videos with audio.",
-  "permissions": [
-    "downloads",
-    "storage",
-    "activeTab",
-    "scripting"
-  ],
+  "permissions": ["downloads", "storage", "activeTab", "scripting"],
   "host_permissions": [
     "*://reddit.com/*",
     "*://*.reddit.com/*",
@@ -22,9 +17,7 @@
       "id": "reddit-grab@talix.dev",
       "strict_min_version": "140.0",
       "data_collection_permissions": {
-        "required": [
-          "none"
-        ]
+        "required": ["none"]
       }
     },
     "gecko_android": {
@@ -32,26 +25,12 @@
     }
   },
   "background": {
-    "scripts": [
-      "reddit-media.js",
-      "reddit-requests.js",
-      "download-recovery.js",
-      "background.js"
-    ]
+    "scripts": ["reddit-media.js", "reddit-requests.js", "download-recovery.js", "background.js"]
   },
   "content_scripts": [
     {
-      "matches": [
-        "*://reddit.com/*",
-        "*://*.reddit.com/*"
-      ],
-      "js": [
-        "reddit-media.js",
-        "reddit-requests.js",
-        "content.js",
-        "reddit-feeds.js",
-        "custom-feeds.js"
-      ],
+      "matches": ["*://reddit.com/*", "*://*.reddit.com/*"],
+      "js": ["reddit-media.js", "reddit-requests.js", "content.js", "reddit-feeds.js", "custom-feeds.js"],
       "run_at": "document_idle"
     }
   ],

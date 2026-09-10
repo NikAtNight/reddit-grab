@@ -119,6 +119,8 @@
     }
 
     const sourceUrl = normalizeUrl(post.url_overridden_by_dest || post.url);
+    const supplied = globalThis.RedditGrabProviders?.extract(sourceUrl);
+    if (supplied?.length) return supplied;
 
     // Already-direct Giphy URLs should remain direct. Page and embed links are
     // represented as external items so the background can choose GIF or MP4.

@@ -227,6 +227,8 @@ async function resolveRedditVideo(item) {
 async function resolveItem(item) {
   if (item.kind === "direct") return item;
   if (item.kind === "reddit-video") return resolveRedditVideo(item);
+  const supplied = await globalThis.RedditGrabProviders?.resolve(item);
+  if (supplied) return supplied;
   if (item.kind === "external" && item.provider === "giphy") {
     return { kind: "direct", url: `https://i.giphy.com/${item.id}.gif`, suffix: item.suffix, ext: "gif" };
   }
@@ -389,7 +391,7 @@ function isRedditUrl(value) {
 async function injectContentScript(tabId) {
   await api.scripting.executeScript({
     target: { tabId },
-    files: ["reddit-media.js", "reddit-requests.js", "content.js", "reddit-feeds.js", "custom-feeds.js"],
+    files: [...(globalThis.RedditGrabProviders ? ["local-provider.js"] : []), "reddit-media.js", "reddit-requests.js", "content.js", "reddit-feeds.js", "custom-feeds.js"],
   });
 }
 

@@ -151,3 +151,15 @@ test("inherits a signed manifest query for relative DASH streams", () => {
     audioUrl: "https://v.redd.it/id/audio.mp4?token=signed",
   });
 });
+
+test("optional providers can select original media before a derived preview", async () => {
+  const context = { URL, RedditGrabProviders: { extract: url => url === "https://provider.example/watch/fixture"
+    ? [{ kind: "external", provider: "fixture", id: "sample", suffix: "" }] : null } };
+  vm.runInNewContext(await readFile("reddit-media.js", "utf8"), context);
+  const result = context.RedditGrabMedia.extractMedia({ id: "fixture",
+    url: "https://provider.example/watch/fixture",
+    preview: { reddit_video_preview: { fallback_url: "https://v.redd.it/preview.mp4", has_audio: false } },
+  });
+  assert.equal(result.items[0].provider, "fixture");
+  assert.equal(context.RedditGrabMedia.extractMedia({ id: "image", url: "https://i.redd.it/image.jpg" }).items[0].kind, "direct");
+});

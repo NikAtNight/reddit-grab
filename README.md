@@ -267,3 +267,27 @@ The page reports its results directly.
 
 The build copies a strict allowlist of source files plus `icons/` and `vendor/`
 into each package. Browser-specific manifests live under `manifests/`.
+
+### Local media providers
+
+The default build works on its own and includes only tracked source files.
+Optional provider code can live in `.local-providers/`, excluded through your
+checkout's `.git/info/exclude`. This is local Git configuration and is not shared
+with other clones.
+
+A local provider supplies `provider.js`, which defines `RedditGrabProviders` with
+`extract(sourceUrl)` and asynchronous `resolve(item)` methods. Return `null` for
+unsupported inputs. Extraction precedes derived previews; resolution precedes
+built-in external-host handling. `config.json` supplies any extra
+`host_permissions` as an array of match patterns.
+
+```sh
+npm run build -- --private
+```
+
+Private packages go to `dist/private/chrome` and `dist/private/firefox`. The build
+includes the provider in both content and background contexts and adds only that
+build's extra host permissions. Missing local files make this command fail before
+changing output. Default packages stay in `dist/chrome` and `dist/firefox` and
+never include local provider code, even when it is installed. Anyone receiving a
+private package can inspect the provider JavaScript inside it.

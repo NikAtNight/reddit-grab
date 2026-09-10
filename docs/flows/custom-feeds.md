@@ -312,3 +312,33 @@ Verification used base commit `7e171cf` with the source and test patch saved at
 Installed Zen/Firefox and Chrome execution, authenticated feed writes, and real
 network-interrupted downloads remain NOT RUN. Synthetic tests do not establish
 those installed-browser boundaries.
+
+
+## Optional local media providers
+
+Requirement source: the user's September 10 request to keep optional provider
+implementation outside tracked source and sanitize published history. Owner:
+Reddit Media Grab maintainer. Repository visibility is unchanged.
+
+`reddit-media.js` calls optional `RedditGrabProviders.extract` before derived
+previews. `background.js` calls its asynchronous `resolve` for external media.
+Both methods return null for unsupported inputs, preserving built-in handling.
+These two hooks share the same optional provider contract. The provider is absent
+from the default build, which must remain independently usable.
+
+`scripts/build.mjs --private` reads `.local-providers/provider.js` and config,
+then emits separate `dist/private` packages. The provider loads before extraction
+and background work in both browsers, including explicit content reinjection.
+Additional host permissions exist only in private manifests. Default builds copy
+the public allowlist and never include optional provider files. Provider paths are
+excluded locally through `.git/info/exclude`, not a tracked ignore rule.
+
+PASS: public `npm run check`, 98 tests, both builds and zero Firefox lint issues.
+PASS: local provider checks for original-media selection, resolution, credential
+refresh, unsupported inputs, and private package wiring. Private Firefox lint
+also reported zero issues. No live authenticated downloads were run.
+
+History sanitization preserved commit topology, authors, dates, and messages.
+Every rewritten ordinary commit tree was scanned; changed JavaScript and JSON
+passed syntax checks. Available historical media tests passed. Private backups
+and tool-owned local checkpoints remain outside published branch history.

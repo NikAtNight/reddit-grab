@@ -3,12 +3,13 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
 
-async function loadBackground({ download, state = {}, tabMessage, tabs = [] } = {}) {
+async function loadBackground({ download, state = {}, tabMessage, tabs = [], provider } = {}) {
   const downloads = [];
   let messageListener;
   let changed;
   const transfers = new Map();
   const context = {
+    RedditGrabProviders: provider,
     URL,
     URLSearchParams,
     setTimeout,
@@ -168,4 +169,15 @@ test("background queue relays to the requesting main-frame tab and rejects other
     assert.equal((await message({ type: "reddit-grab-request", request }, invalid)).ok, false);
   }
   assert.equal(calls.length, 1);
+});
+
+test("background resolves optional provider items without changing ordinary downloads", async () => {
+  const { message, downloads } = await loadBackground({ provider: { resolve: async item => item.provider === "fixture"
+    ? { kind: "direct", url: "https://media.example/original.mp4", ext: "mp4", suffix: item.suffix } : null } });
+  const result = await message({ type: "download-media", job: { postId: "provider", subreddit: "examples", items: [
+    { kind: "external", provider: "fixture", id: "sample", suffix: "_01" }, gallery.items[0],
+  ] } });
+  assert.equal(result.saved, 2);
+  assert.equal(downloads[0].url, "https://media.example/original.mp4");
+  assert.equal(downloads[1].url, gallery.items[0].url);
 });
